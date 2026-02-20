@@ -3,7 +3,7 @@ main.py
 จุดเริ่มรันโปรเจกต์ Inventory LP Backtester
 
 ทำหน้าที่ร้อยเรียงทุกโมดูลเข้าด้วยกัน และแสดงผลลัพธ์ ROI สุทธิ
-อัปเดต: เพิ่มการโชว์ Effective APR และกราฟ 2 แกน (Net Equity คู่กับ Price)
+อัปเดต: เพิ่มการโชว์ Effective APR, กราฟ 2 แกน, แก้ไขข้อความวันให้ไดนามิก
 """
 
 from datetime import datetime
@@ -16,28 +16,27 @@ from src.portfolio.portfolio import PortfolioModule
 from src.engine.backtest_engine import BacktestEngine
 
 def run_sample_simulation():
-    print("--- Starting Backtest Simulation v1.0.3 (Base APR + Price Chart) ---")
+    print("--- Starting Backtest Simulation v1.0.4 ---")
     
     # 1. Setup Configs
     capital = 10000.0
     
-    # Oracle: ลด Volatility เป็น 50% ให้สมจริง
+    # รัน 120 วัน ความผันผวน 50%
     oracle_cfg = OracleConfig(start_price=2000.0, days=120, annual_volatility=0.50, seed=123)
     
-    # LP: [PM UPDATED] ใช้โหมด Base APR = 5% 
     lp_cfg = LPConfig(
         initial_capital=capital, 
-        range_width=0.10, 
-        rebalance_threshold=0.15,
+        range_width=0.20, 
+        rebalance_threshold=0.25,
         fee_mode='base_apr',
-        base_apr=0.05  # Base APR 5%
+        base_apr=0.05 
     )
     
     perp_cfg = PerpConfig(leverage=1.0)
     
-    # Strategy: "Always Hedge"
+    # [PM FIXED]: ใช้โหมด 'always' อย่างเป็นทางการ บอทจะไม่สน EMA อีกต่อไป
     strat_cfg = StrategyConfig(
-        ema_period=9999, 
+        hedge_mode='always',
         safety_net_pct=0.03,
         hedge_threshold=0.10 
     )
@@ -57,8 +56,6 @@ def run_sample_simulation():
     print(f"Generated {len(data)} hours of price data.")
     
     results = engine.run(data, strat_cfg)
-    
-    # แทรกราคา Price จาก Oracle เข้าไปใน DataFrame ของ Results เพื่อนำไปพล็อต
     results['price'] = data['close'].values
     
     # 4. Summary Result
@@ -68,7 +65,7 @@ def run_sample_simulation():
     effective_apr = lp_cfg.base_apr * lp.multiplier * 100
     
     print("\n" + "="*40)
-    print(f"SIMULATION COMPLETE (30 Days)")
+    print(f"SIMULATION COMPLETE ({oracle_cfg.days} Days)")
     print("="*40)
     print(f"LP Setting      : Base APR {lp_cfg.base_apr*100}% | Range ±{lp_cfg.range_width*100}%")
     print(f"LP Multiplier   : {lp.multiplier:.2f}x")
@@ -84,7 +81,6 @@ def run_sample_simulation():
     # 5. Plot Results (Dual Axis)
     fig, ax1 = plt.subplots(figsize=(12, 6))
 
-    # แกน Y ฝั่งซ้าย (Net Equity) - เส้นสีฟ้า
     color1 = 'tab:blue'
     ax1.set_xlabel('Time (Hours)')
     ax1.set_ylabel('Net Equity ($)', color=color1, fontweight='bold')
@@ -92,15 +88,13 @@ def run_sample_simulation():
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.grid(True, linestyle='--', alpha=0.6)
 
-    # แกน Y ฝั่งขวา (ETH Price) - เส้นสีส้ม
     ax2 = ax1.twinx()  
     color2 = 'tab:orange'
     ax2.set_ylabel('ETH Price ($)', color=color2, fontweight='bold')  
     ax2.plot(results.index, results['price'], color=color2, label='ETH Price (Right)', linewidth=1.5, alpha=0.7, linestyle='-.')
     ax2.tick_params(axis='y', labelcolor=color2)
 
-    # ใส่ Title และโชว์กราฟ
-    plt.title(f"Always Hedge LP Performance\nROI: {total_roi:.2f}% | Eff. APR: {effective_apr:.2f}%", fontweight='bold')
+    plt.title(f"Always Hedge LP Performance ({oracle_cfg.days} Days)\nROI: {total_roi:.2f}% | Eff. APR: {effective_apr:.2f}%", fontweight='bold')
     fig.tight_layout()
     plt.show()
 
