@@ -1,0 +1,38 @@
+# =========================================================
+# ⚙️ QUANT LAB: Inventory LP & Delta Hedge Configuration
+# =========================================================
+
+# [1] Capital Allocation (การจัดสรรเงินทุน)
+capital:
+  lp_capital: 10000.0      # เงินต้นที่จะวางใน LP (On-chain)
+  perp_capital: 3000.0     # เงินค้ำประกันเปิด Short ใน CEX (Idle Cash)
+  leverage: 5.0            # อัตราทดสำหรับ Perpetual (เช่น 5.0 = 5x)
+  rebalance_freq_days: 30  # รอบเวลาที่จะโอนเงินข้ามกระเป๋า (เช่น ทุก 1 เดือน)
+
+# [2] Market Simulator (การจำลองตลาด)
+market:
+  start_price: 2000.0      # ราคาเริ่มต้นของ ETH
+  days_to_run: 360         # จำนวนวันที่ต้องการรันจำลอง
+  annual_volatility: 0.70  # ความผันผวนต่อปี (เช่น 0.50 = 50%, ลอง 1.2 สำหรับตลาดแตก)
+  seed: 42                 # Seed สำหรับล็อกกราฟราคา (ถ้าต้องการสุ่มอิสระให้ลบค่านี้ทิ้ง หรือใส่ null)
+
+# [3] LP Parameters (การตั้งค่า Steer Protocol)
+lp:
+  base_apr: 0.04           # รายได้พื้นฐานต่อปี (เช่น 0.04 = 4%)
+  range_width: 0.10        # ความกว้างของช่วงราคา (+/- 10%)
+  rebalance_threshold: 0.25 # จุดเบี่ยงเบน Skew ก่อนสั่ง Rebalance (เช่น 0.25)
+
+# [4] Hedge Strategy & Residual Risk (กลยุทธ์ป้องกันความเสี่ยง)
+strategy:
+  hedge_mode: 'always'     # โหมดป้องกันความเสี่ยง: 'always' หรือ 'smart'
+  use_safety_net: true     # สวิตช์เปิดใช้งานปุ่มฉุกเฉินตอนราคากระชาก (true/false)
+  safety_net_pct: 0.03     # ถ้าราคาขยับเกิน % นี้ใน 1 ชม. จะเตะปลั๊กบังคับ Hedge ให้เป๊ะ
+  hedge_threshold: 0.20    # Residual Risk ที่ยอมรับได้ ปล่อยให้ Delta ไหลได้ 25% เพื่อประหยัดค่า Fee
+  ema_period: 200          # จำนวนแท่งสำหรับคำนวณ EMA (ใช้เฉพาะโหมด 'smart')
+
+# [5] Fees & Frictions (ค่าธรรมเนียมโลกจริง)
+costs:
+  gas_fee_usd: 2.0         # ค่าแก๊ส (USD) ต่อการทำ On-chain Rebalance 1 ครั้ง
+  slippage: 0.001          # Slippage (0.1%) ตอนทำ Active Swap ใน Pool
+  perp_taker_fee: 0.0005   # ค่าธรรมเนียม Taker (0.05%) บน Binance
+  funding_rate_8h: 0.0001  # Funding Rate ต่อ 8 ชั่วโมง (เช่น 0.0001 = 0.01%)
