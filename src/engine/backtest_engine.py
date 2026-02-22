@@ -3,10 +3,11 @@ src/engine/backtest_engine.py
 โมดูล Backtest Engine (The Orchestrator) สำหรับโปรเจกต์ Inventory LP Backtester
 
 ประวัติการแก้ไข:
-- v1.0.3 (2026-02-20): [PM FIXED] อัปเดต Logic การทำ ADJUST_HEDGE ขาลง ให้ใช้ close_partial_position ประหยัดค่า Fee
+- v1.0.4 (2026-02-22): [PM FIXED] รองรับ TransactionType ใหม่ แยก Slippage ออกจาก Perp Fee 
+                       และเพิ่มตัวนับ hedge_count
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 import pandas as pd
 from typing import List
@@ -35,6 +36,7 @@ class BacktestEngine:
         self.perp = perp
         self.strategy = strategy
         self.portfolio = portfolio
+        self.hedge_count = 0 # [PM ADDED] ตัวนับการยิงออเดอร์เข้า CEX
 
     def run(self, data_feed: pd.DataFrame, strategy_config: StrategyConfig, funding_rate: float = 0.0001) -> pd.DataFrame:
         df = self.strategy.populate_indicators(data_feed, strategy_config)
@@ -60,7 +62,8 @@ class BacktestEngine:
             rebalance_res = self.lp.check_and_rebalance()
             if rebalance_res.is_rebalanced:
                 self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebalance_res.gas_cost)
-                self.portfolio.record_transaction(TransactionType.EXPENSE_TRADING_FEE, -rebalance_res.slippage_cost)
+                # [PM FIXED] ใช้ EXPENSE_SLIPPAGE
+                self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebalance_res.slippage_cost)
 
             # --- STEP 4: Strategy Execution ---
             if not pd.isna(row['signal']):
@@ -71,7 +74,8 @@ class BacktestEngine:
                         diff: float = order.target_size - self.perp.get_short_position_size()
                         if diff > 0:
                             fee = self.perp.open_position(PositionSide.SHORT, diff)
-                            self.portfolio.record_transaction(TransactionType.EXPENSE_TRADING_FEE, -fee)
+                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                            self.hedge_count += 1
                             
                     elif order.action == 'HEDGE_OFF':
                         self._close_all_shorts()
@@ -79,15 +83,15 @@ class BacktestEngine:
                     elif order.action == 'ADJUST_HEDGE':
                         diff: float = order.target_size - self.perp.get_short_position_size()
                         if diff > 0:
-                            # ขาดของ -> เปิด Short เพิ่ม (Perp v1.0.2 จะทำการถัวเฉลี่ยให้เอง)
                             fee = self.perp.open_position(PositionSide.SHORT, diff)
-                            self.portfolio.record_transaction(TransactionType.EXPENSE_TRADING_FEE, -fee)
+                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                            self.hedge_count += 1
                         elif diff < 0:
-                            # ของเกิน -> [FIXED] ใช้ระบบปิดบางส่วน (Partial Close)
                             size_to_close = abs(diff)
                             realized_pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, size_to_close)
                             self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
-                            self.portfolio.record_transaction(TransactionType.EXPENSE_TRADING_FEE, -fee)
+                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                            self.hedge_count += 1
 
             # --- STEP 5: Funding Rate ---
             if current_time.hour % 8 == 0 and current_time != last_funding_time:
@@ -113,4 +117,5 @@ class BacktestEngine:
             realized_pnl = self.perp.positions[PositionSide.SHORT].unrealized_pnl
             fee = self.perp.close_position(PositionSide.SHORT)
             self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
-            self.portfolio.record_transaction(TransactionType.EXPENSE_TRADING_FEE, -fee)
+            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+            self.hedge_count += 1

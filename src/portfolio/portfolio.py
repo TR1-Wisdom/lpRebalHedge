@@ -3,9 +3,10 @@ src/portfolio/portfolio.py
 โมดูล Portfolio (Central Ledger) สำหรับโปรเจกต์ Inventory LP Backtester
 
 บริหารจัดการกระแสเงินสดและ Net Equity ของระบบทั้งหมด โดยใช้ Enum เพื่อความแม่นยำของบัญชี
+อัปเดต: v1.0.3 เพิ่ม EXPENSE_SLIPPAGE แยกออกจาก PERP_FEE เพื่อรองรับ PnL Statement แบบเจาะลึก
 """
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 from dataclasses import dataclass
 from typing import Dict
@@ -18,7 +19,8 @@ class TransactionType(Enum):
     REVENUE_LP_FEE = "REVENUE_LP_FEE"
     REVENUE_FUNDING = "REVENUE_FUNDING"
     EXPENSE_GAS = "EXPENSE_GAS"
-    EXPENSE_TRADING_FEE = "EXPENSE_TRADING_FEE"
+    EXPENSE_PERP_FEE = "EXPENSE_PERP_FEE"  # [PM FIXED] เปลี่ยนชื่อให้ชัดเจน
+    EXPENSE_SLIPPAGE = "EXPENSE_SLIPPAGE"  # [PM FIXED] เพิ่มหมวด Slippage แยกต่างหาก
     EXPENSE_FUNDING = "EXPENSE_FUNDING"
     DEPOSIT = "DEPOSIT"
 
@@ -36,7 +38,7 @@ class PortfolioState:
 
 
 class PortfolioModule:
-    """ระบบบัญชีกลาง (Central Bank) - Audit Version v1.0.2"""
+    """ระบบบัญชีกลาง (Central Bank) - Audit Version v1.0.3"""
 
     def __init__(self, initial_capital: float) -> None:
         """เริ่มต้นพอร์ตด้วยเงินทุนตั้งต้น"""
@@ -49,7 +51,8 @@ class PortfolioModule:
             TransactionType.REVENUE_LP_FEE: 0.0,
             TransactionType.REVENUE_FUNDING: 0.0,
             TransactionType.EXPENSE_GAS: 0.0,
-            TransactionType.EXPENSE_TRADING_FEE: 0.0,
+            TransactionType.EXPENSE_PERP_FEE: 0.0,
+            TransactionType.EXPENSE_SLIPPAGE: 0.0,
             TransactionType.EXPENSE_FUNDING: 0.0
         }
 
@@ -85,5 +88,6 @@ class PortfolioModule:
             perp_pnl=perp_pnl,
             total_fees_collected=self.ledgers[TransactionType.REVENUE_LP_FEE],
             total_costs=abs(self.ledgers[TransactionType.EXPENSE_GAS]) + 
-                        abs(self.ledgers[TransactionType.EXPENSE_TRADING_FEE])
+                        abs(self.ledgers[TransactionType.EXPENSE_PERP_FEE]) +
+                        abs(self.ledgers[TransactionType.EXPENSE_SLIPPAGE])
         )
