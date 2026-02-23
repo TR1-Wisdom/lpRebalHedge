@@ -1,10 +1,10 @@
 """
 src/engine/backtest_engine.py
-อัปเดต: v1.3.0 (Lag Simulation)
-- เพิ่มระบบ Execution Interval เพื่อจำลองความล่าช้าในการ Rebalance/Hedge
+อัปเดต: v1.3.1 (Emergency Rescue Edition)
+- เพิ่มระบบ Emergency Margin Rescue ดึงกำไรจาก LP มาช่วย CEX อัตโนมัติ
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import pandas as pd
 from typing import List, Dict, Any
@@ -45,7 +45,7 @@ class BacktestEngine:
         df = self.strategy.populate_signals(df)
 
         history: List[PortfolioState] = []
-        last_execution_time: datetime = datetime(1970, 1, 1) # เก็บเวลาที่รันล่าสุด
+        last_execution_time: datetime = datetime(1970, 1, 1) 
         last_funding_time: datetime = df['date'].iloc[0]
         
         last_withdrawal_date = df['date'].iloc[0]
@@ -58,28 +58,22 @@ class BacktestEngine:
             current_price: float = row['close']
             rebalanced_this_tick = False
 
-            # อัปเดตราคาตลาดทุกวินาที (PnL วิ่งตลอดเวลา)
             self.lp.update_price(current_price)
             self.perp.update_market_price(current_price)
 
-            # --- CHECK EXECUTION INTERVAL ---
-            # จะตัดสินใจเทรดหรือปรับพอร์ตได้เฉพาะเมื่อครบรอบนาทีที่กำหนดเท่านั้น
+            lp_fee: float = self.lp.collect_fee()
+            if lp_fee > 0:
+                self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
+
             can_execute = (current_time - last_execution_time).total_seconds() >= (execution_interval_min * 60)
 
             if can_execute:
-                # 1. Collect Fees (ทำตามรอบ)
-                lp_fee: float = self.lp.collect_fee()
-                if lp_fee > 0:
-                    self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
-
-                # 2. Rebalance LP (ทำตามรอบ)
                 rebalance_res = self.lp.check_and_rebalance()
                 if rebalance_res.is_rebalanced:
                     self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebalance_res.gas_cost)
                     self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebalance_res.slippage_cost)
                     rebalanced_this_tick = True
 
-                # 3. Hedge Strategy (ทำตามรอบ - นี่คือจุดที่อันตรายถ้า interval_min สูง)
                 if not pd.isna(row['signal']):
                     orders = self.strategy.generate_orders(row, strategy_config)
                     for order in orders:
@@ -104,12 +98,37 @@ class BacktestEngine:
 
                         except ValueError as e:
                             if str(e) == "MARGIN_CALL":
-                                notional_needed = abs(order.target_size - self.perp.get_short_position_size()) * current_price
+                                # --- [KEY FIX] EMERGENCY MARGIN RESCUE ---
+                                current_short_size = self.perp.get_short_position_size()
+                                target_diff = order.target_size - current_short_size
+                                
+                                notional_needed = abs(target_diff) * current_price
                                 trading_fee = notional_needed * self.perp.config.taker_fee
                                 margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
                                 
                                 available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
+                                deficit = (margin_needed - available_margin) + 20.0 # ขอเติมเผื่อไว้ 20$
                                 
+                                current_lp_profit = self.lp.position_value - self.lp_initial_capital
+                                
+                                # ถ้า LP มีกำไรมากพอที่จะอุ้ม CEX ได้
+                                if current_lp_profit > deficit and deficit > 0:
+                                    # โอนกำไรข้ามพอร์ต
+                                    self.lp.position_value -= deficit
+                                    self.portfolio.record_transaction(TransactionType.WITHDRAWAL, -deficit)
+                                    self.portfolio.record_transaction(TransactionType.DEPOSIT, deficit)
+                                    
+                                    # ยิงคำสั่ง Hedge ซ้ำอีกรอบ
+                                    try:
+                                        if target_diff > 0:
+                                            fee = self.perp.open_position(PositionSide.SHORT, target_diff, self.portfolio.cex_wallet_balance)
+                                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                                            self.hedge_count += 1
+                                        continue # รอดตาย! ข้ามการบันทึก Margin Call ทิ้งไปเลย
+                                    except ValueError:
+                                        pass
+                                
+                                # ถ้า LP ก็ขาดทุนจนช่วยไม่ไหว ค่อยยอมรับสภาพพอร์ตแตก
                                 self.margin_call_events.append({
                                     'timestamp': current_time,
                                     'price': current_price,
@@ -117,9 +136,8 @@ class BacktestEngine:
                                     'margin_needed': margin_needed
                                 })
 
-                last_execution_time = current_time # อัปเดตเวลาที่รันล่าสุด
+                last_execution_time = current_time 
 
-            # 4. Withdraw Passive Income (ตรวจสอบหลัง Rebalance)
             if withdraw_enabled and rebalanced_this_tick:
                 days_since_last = (current_time - last_withdrawal_date).days
                 if days_since_last >= withdraw_freq:
@@ -132,7 +150,6 @@ class BacktestEngine:
                         self.withdrawal_count += 1
                         last_withdrawal_date = current_time
 
-            # 5. Funding Rate Calculation (ทุก 8 ชั่วโมง)
             if (current_time - last_funding_time).total_seconds() >= 8 * 3600:
                 funding_pnl: float = self.perp.apply_funding(funding_rate)
                 if funding_pnl > 0:
@@ -141,7 +158,6 @@ class BacktestEngine:
                     self.portfolio.record_transaction(TransactionType.EXPENSE_FUNDING, funding_pnl)
                 last_funding_time = current_time
 
-            # 6. บันทึก Portfolio State ลงประวัติ
             state: PortfolioState = self.portfolio.get_state(
                 current_time, 
                 self.lp.position_value, 

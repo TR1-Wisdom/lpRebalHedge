@@ -5,7 +5,7 @@
 # [1] Capital Allocation
 capital:
   lp_capital: 10000.0      
-  perp_capital: 4000.0     
+  perp_capital: 5000.0     
   leverage: 5.0            
 
 # [2] Market Simulator
