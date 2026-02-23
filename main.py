@@ -86,7 +86,7 @@ def run_simulation_from_config():
     
     engine = BacktestEngine(oracle, lp, perp, strategy, portfolio)
     data = oracle.generate_data(oracle_cfg)
-    print(f"[*] Generated {len(data)} hours of price data. Starting Simulation...")
+    print(f"[*] Generated {len(data)} ticks of market data (5m resolution). Starting Simulation...")
     
     harvest_cfg = cfg.get('harvesting', {})
     

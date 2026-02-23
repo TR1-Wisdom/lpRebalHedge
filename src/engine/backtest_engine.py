@@ -133,7 +133,7 @@ class BacktestEngine:
                         last_withdrawal_date = current_time
 
             # 5. Funding Rate Calculation (ทุก 8 ชั่วโมง)
-            if current_time.hour % 8 == 0 and current_time != last_funding_time:
+            if (current_time - last_funding_time).total_seconds() >= 8 * 3600:
                 funding_pnl: float = self.perp.apply_funding(funding_rate)
                 if funding_pnl > 0:
                     self.portfolio.record_transaction(TransactionType.REVENUE_FUNDING, funding_pnl)

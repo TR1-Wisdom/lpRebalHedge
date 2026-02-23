@@ -55,4 +55,4 @@ optimization_space:
 
 # [8] Execution Settings (NEW)
 execution:
-  interval_minutes: 30  # จำลองความหน่วงของ Protocol (เช่น Steer = 15, ทำเองบน VPS = 1)
+  interval_minutes: 5  # จำลองความหน่วงของ Protocol (เช่น Steer = 15, ทำเองบน VPS = 1)
