@@ -2,10 +2,12 @@
 src/portfolio/portfolio.py
 โมดูล Portfolio (Central Ledger)
 
-อัปเดต: v1.0.5 รองรับระบบ WITHDRAWAL สำหรับ Passive Income
+อัปเดต: v1.0.6 (Audit Fix)
+- เปลี่ยนชื่อ idle_cash เป็น cex_wallet_balance ให้สะท้อนความจริง
+- เพิ่ม cex_available_margin ใน PortfolioState 
 """
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 from dataclasses import dataclass
 from typing import Dict
@@ -21,27 +23,28 @@ class TransactionType(Enum):
     EXPENSE_SLIPPAGE = "EXPENSE_SLIPPAGE"
     EXPENSE_FUNDING = "EXPENSE_FUNDING"
     DEPOSIT = "DEPOSIT"
-    WITHDRAWAL = "WITHDRAWAL" # [NEW] สำหรับถอน Passive Income ออกจากระบบ
+    WITHDRAWAL = "WITHDRAWAL"
 
 
 @dataclass
 class PortfolioState:
     timestamp: datetime
     net_equity: float
-    idle_cash: float
+    cex_wallet_balance: float     # [NEW] เงินต้น + กำไร/ขาดทุนที่รับรู้แล้วใน CEX
+    cex_available_margin: float   # [NEW] เงินที่เหลือให้เปิดออเดอร์ (หัก Margin ล็อกไว้แล้ว)
     lp_value: float
     perp_pnl: float
     total_fees_collected: float
     total_costs: float
-    total_withdrawn: float # [NEW] ติดตามยอดเงินที่ถอนออกไปแล้ว
+    total_withdrawn: float
 
 
 class PortfolioModule:
     def __init__(self, initial_capital: float) -> None:
         self.initial_capital: float = initial_capital
-        self.idle_cash: float = initial_capital  
+        self.cex_wallet_balance: float = initial_capital  # เปลี่ยนชื่อจาก idle_cash
         self.lp_allocated_cash: float = 0.0
-        self.total_withdrawn_amount: float = 0.0 # สะสมยอดถอนจริง
+        self.total_withdrawn_amount: float = 0.0
         
         self.ledgers: Dict[TransactionType, float] = {
             TransactionType.REVENUE_LP_FEE: 0.0,
@@ -55,15 +58,20 @@ class PortfolioModule:
         }
 
     def allocate_to_lp(self, amount: float) -> float:
-        allocation: float = min(amount, self.idle_cash)
-        self.idle_cash -= allocation
+        allocation: float = min(amount, self.cex_wallet_balance)
+        self.cex_wallet_balance -= allocation
         self.lp_allocated_cash += allocation
         return allocation
+
+    def return_from_lp(self, amount: float) -> None:
+        self.lp_allocated_cash -= amount
+        self.cex_wallet_balance += amount
 
     def record_transaction(self, category: TransactionType, amount: float) -> None:
         if category in self.ledgers:
             self.ledgers[category] += amount
             
+            # เฉพาะค่าใช้จ่าย/รายได้บน CEX เท่านั้นที่กระทบกระเป๋า CEX
             cex_transactions = [
                 TransactionType.EXPENSE_PERP_FEE,
                 TransactionType.REVENUE_FUNDING,
@@ -71,26 +79,30 @@ class PortfolioModule:
                 TransactionType.DEPOSIT
             ]
             if category in cex_transactions:
-                self.idle_cash += amount
+                self.cex_wallet_balance += amount
             
-            # บันทึกยอดถอนสะสม (ยอดถอนจะถูกส่งมาเป็นค่าลบ)
+            # ถอนเงินนอกระบบ (Passive Income)
             if category == TransactionType.WITHDRAWAL:
                 self.total_withdrawn_amount += abs(amount)
 
     def get_net_equity(self, current_lp_value: float, current_perp_pnl: float) -> float:
-        return self.idle_cash + current_lp_value + current_perp_pnl
+        return self.cex_wallet_balance + current_lp_value + current_perp_pnl
 
-    def get_state(self, timestamp: datetime, lp_val: float, perp_pnl: float) -> PortfolioState:
+    def get_state(self, timestamp: datetime, lp_val: float, perp_pnl: float, margin_used: float) -> PortfolioState:
         total_costs = (
             abs(self.ledgers[TransactionType.EXPENSE_GAS]) + 
             abs(self.ledgers[TransactionType.EXPENSE_PERP_FEE]) +
             abs(self.ledgers[TransactionType.EXPENSE_SLIPPAGE])
         )
         
+        # [KEY FIX] คำนวณ Available Margin ที่แท้จริง
+        available_margin = self.cex_wallet_balance + perp_pnl - margin_used
+        
         return PortfolioState(
             timestamp=timestamp,
             net_equity=self.get_net_equity(lp_val, perp_pnl),
-            idle_cash=self.idle_cash,
+            cex_wallet_balance=self.cex_wallet_balance,
+            cex_available_margin=available_margin,
             lp_value=lp_val,
             perp_pnl=perp_pnl,
             total_fees_collected=self.ledgers[TransactionType.REVENUE_LP_FEE],

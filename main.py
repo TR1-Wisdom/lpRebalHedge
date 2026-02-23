@@ -2,9 +2,9 @@
 main.py
 จุดเริ่มรันโปรเจกต์ Inventory LP Backtester
 
-อัปเดตล่าสุด: v1.1.5 (Add Min Margin Tracker)
-- ผสานระบบถอนเงิน (Passive Income Harvesting) เข้ากับ CSV Export แบบเต็มรูปแบบ
-- เพิ่มระบบติดตาม Min CEX Margin (Lowest) เพื่อประเมินความเสี่ยงเงินค้ำประกัน
+อัปเดตล่าสุด: v1.2.0 (Stable Release)
+- [FIX] คำนวณ Sharpe Ratio และ Max Drawdown จาก Total Wealth เพื่อป้องกันค่าสถิติเพี้ยนจากการถอนเงิน
+- Freeze version สำหรับเตรียมนำไปใช้ทำ Optimization
 """
 
 import os
@@ -22,14 +22,12 @@ from src.portfolio.portfolio import PortfolioModule, TransactionType
 from src.engine.backtest_engine import BacktestEngine
 
 def load_config(file_path: str = 'config.yaml') -> dict:
-    """อ่านไฟล์ YAML และคืนค่าเป็น Dictionary"""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"⚠️ ไม่พบไฟล์ตั้งค่า: {file_path}")
     with open(file_path, 'r', encoding='utf-8') as file:
         return yaml.safe_load(file)
 
 def run_simulation_from_config():
-    # 1. โหลดไฟล์ Config
     try:
         cfg = load_config('config.yaml')
     except Exception as e:
@@ -37,23 +35,18 @@ def run_simulation_from_config():
         return
 
     print("="*65)
-    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.1.5")
+    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.2.0 (Stable)")
     print("="*65)
     
-    # 2. Extract Configs to Dataclasses
-    # --- Capital ---
     lp_capital = float(cfg['capital']['lp_capital'])
     perp_capital = float(cfg['capital']['perp_capital'])
     total_capital = lp_capital + perp_capital
     leverage = float(cfg['capital']['leverage'])
-    
-    # --- Market ---
     days_to_run = int(cfg['market']['days_to_run'])
+    funding_rate_8h = float(cfg['costs']['funding_rate_8h'])
+    
     seed_val = cfg['market']['seed']
-    if seed_val == 'null' or seed_val is None:
-        seed_val = None
-    else:
-        seed_val = int(seed_val)
+    seed_val = int(seed_val) if seed_val not in ['null', None, 'None', ''] else None
 
     oracle_cfg = OracleConfig(
         start_price=float(cfg['market']['start_price']), 
@@ -62,92 +55,66 @@ def run_simulation_from_config():
         seed=seed_val
     )
     
-    # --- LP ---
-    base_apr_val = float(cfg['lp']['base_apr'])
-    range_width_val = float(cfg['lp']['range_width'])
-    rebalance_threshold_val = float(cfg['lp']['rebalance_threshold'])
-    
     lp_cfg = LPConfig(
         initial_capital=lp_capital, 
-        range_width=range_width_val, 
-        rebalance_threshold=rebalance_threshold_val,
+        range_width=float(cfg['lp']['range_width']), 
+        rebalance_threshold=float(cfg['lp']['rebalance_threshold']),
         fee_mode='base_apr',
-        base_apr=base_apr_val,
+        base_apr=float(cfg['lp']['base_apr']),
         gas_fee=float(cfg['costs']['gas_fee_usd']),
         slippage=float(cfg['costs']['slippage'])
     )
     
-    # --- Perp ---
-    perp_taker_fee_val = float(cfg['costs']['perp_taker_fee'])
-    perp_cfg = PerpConfig(
-        leverage=leverage,
-        taker_fee=perp_taker_fee_val
-    )
-    
-    # --- Strategy ---
-    hedge_mode_val = cfg['strategy']['hedge_mode']
-    use_safety_net_val = bool(cfg['strategy']['use_safety_net'])
-    safety_net_pct_val = float(cfg['strategy']['safety_net_pct'])
-    hedge_threshold_val = float(cfg['strategy']['hedge_threshold'])
-    ema_period_val = int(cfg['strategy']['ema_period'])
-    
     strat_cfg = StrategyConfig(
-        hedge_mode=hedge_mode_val,
-        use_safety_net=use_safety_net_val,
-        safety_net_pct=safety_net_pct_val,
-        hedge_threshold=hedge_threshold_val,
-        ema_period=ema_period_val
+        hedge_mode=cfg['strategy']['hedge_mode'],
+        use_safety_net=bool(cfg['strategy']['use_safety_net']),
+        safety_net_pct=float(cfg['strategy']['safety_net_pct']),
+        hedge_threshold=float(cfg['strategy']['hedge_threshold']),
+        ema_period=int(cfg['strategy']['ema_period'])
     )
     
-    funding_rate_8h = float(cfg['costs']['funding_rate_8h'])
+    perp_cfg = PerpConfig(leverage=leverage, taker_fee=float(cfg['costs']['perp_taker_fee']))
 
-    # 3. Initialize Modules
     oracle = OracleModule()
     lp = LPModule(lp_cfg, oracle_cfg.start_price)
     perp = PerpModule(perp_cfg)
     strategy = StrategyModule(lp, perp)
-    
     portfolio = PortfolioModule(total_capital)
     portfolio.allocate_to_lp(lp_capital) 
     
-    # 4. Setup Engine & Run
     engine = BacktestEngine(oracle, lp, perp, strategy, portfolio)
     data = oracle.generate_data(oracle_cfg)
     print(f"[*] Generated {len(data)} hours of price data. Starting Simulation...")
     
-    # ส่ง harvest_config จาก yaml ไปให้ Engine จัดการถอนเงิน
     harvest_cfg = cfg.get('harvesting', {})
     results = engine.run(data, strat_cfg, funding_rate=funding_rate_8h, harvest_config=harvest_cfg)
     results['price'] = data['close'].values
     
-    # 5. Calculate Advanced Metrics (Wealth Tracking)
     initial_equity = total_capital 
     final_equity = results['net_equity'].iloc[-1]
     total_withdrawn = results['total_withdrawn'].iloc[-1]
     
-    # คำนวณหา CEX Margin ต่ำสุดที่เคยไปถึง
-    cex_equity_series = results['idle_cash'] + results['perp_pnl']
-    min_cex_margin = cex_equity_series.min()
+    min_cex_margin = results['cex_available_margin'].min()
     min_cex_margin_pct = (min_cex_margin / perp_capital) * 100
 
-    # ความมั่งคั่งรวม = เงินที่เหลืออยู่ในระบบ + เงินที่ถอนออกไปใช้แล้ว
     total_wealth = final_equity + total_withdrawn 
-    
     net_profit = total_wealth - initial_equity
     total_roi = net_profit / initial_equity
     cagr = (pow(1 + total_roi, 365 / days_to_run) - 1) * 100
     
-    roll_max = results['net_equity'].cummax()
-    drawdown = (results['net_equity'] - roll_max) / roll_max
+    # [KEY FIX] เปลี่ยนไปใช้ Total Wealth Series ในการคำนวณ MDD และ Sharpe
+    wealth_series = results['net_equity'] + results['total_withdrawn']
+    
+    roll_max = wealth_series.cummax()
+    drawdown = (wealth_series - roll_max) / roll_max
     max_drawdown = drawdown.min() * 100
     
-    hourly_returns = results['net_equity'].pct_change().dropna()
+    hourly_returns = wealth_series.pct_change().dropna()
     std_dev = hourly_returns.std()
     sharpe = (hourly_returns.mean() / std_dev) * np.sqrt(365 * 24) if std_dev > 0 else 0
     
     effective_apr = lp_cfg.base_apr * lp.multiplier * 100
 
-    # 6. Extract Ledger (PnL Statement)
     gross_fees = portfolio.ledgers[TransactionType.REVENUE_LP_FEE]
     funding_received = portfolio.ledgers[TransactionType.REVENUE_FUNDING]
     funding_paid = portfolio.ledgers[TransactionType.EXPENSE_FUNDING]
@@ -160,11 +127,8 @@ def run_simulation_from_config():
     
     total_costs_all = perp_costs + rebal_total_costs
     expected_profit_cashflow = gross_fees + net_funding - total_costs_all
-    
-    # หักลบยอดถอนออกจากสมการเพื่อหา IL สุทธิอย่างแม่นยำ
     delta_pnl = net_profit - expected_profit_cashflow 
     
-    # 7. Print Standard Report
     print("\n" + "="*65)
     print(f"💰 STRATEGIC WEALTH REPORT ({days_to_run} Days)")
     print("="*65)
@@ -176,7 +140,7 @@ def run_simulation_from_config():
     print(f"Net Profit            : ${net_profit:+,.2f}")
     print(f"Raw ROI               : {total_roi*100:+.2f}%")
     print(f"Annualized CAGR       : {cagr:+.2f}%")
-    print(f"Max Drawdown (Live)   : {max_drawdown:.2f}%")
+    print(f"Max Drawdown (Wealth) : {max_drawdown:.2f}%") # แสดงกำกับชัดเจนว่ามาจาก Wealth
     print(f"Sharpe Ratio          : {sharpe:.2f}")
     
     print("\n" + "-"*65)
@@ -190,9 +154,8 @@ def run_simulation_from_config():
     print(f"Hedge Trades          : {engine.hedge_count} Times")
     print(f"Successful Withdrawals: {engine.withdrawal_count} Times")
     print(f"Margin Call Rejects   : {len(engine.margin_call_events)} Times 🚨")
-    print(f"Min CEX Margin (Low)  : ${min_cex_margin:,.2f} ({min_cex_margin_pct:.2f}%)") # แสดงยอด Margin ต่ำสุด
+    print(f"Min CEX Margin (Low)  : ${min_cex_margin:,.2f} ({min_cex_margin_pct:.2f}%)") 
 
-    # --- Print Margin Call Details (Top 3 Worst Cases) ---
     if engine.margin_call_events:
         print("\n" + "🔴 MARGIN CALL ANALYSIS (Worst Cases):")
         sorted_events = sorted(engine.margin_call_events, key=lambda x: x['margin_needed'] - x['available_margin'], reverse=True)
@@ -210,7 +173,6 @@ def run_simulation_from_config():
     print(f"IL & Residual Risk    : {('+' if delta_pnl >= 0 else '')}${delta_pnl:,.2f}")
     print("="*65)
 
-    # 8. CSV Friendly Output (Full Version)
     csv_output = f"""
 \n⬇️ --- COPY BELOW THIS LINE TO EXCEL (CSV Format) --- ⬇️
 Category,Metric,Value
@@ -220,18 +182,18 @@ Category,Metric,Value
 [1. CONFIG],Start Price,{oracle_cfg.start_price}
 [1. CONFIG],Days to Run,{days_to_run}
 [1. CONFIG],Annual Volatility,{oracle_cfg.annual_volatility}
-[1. CONFIG],Seed,{seed_val}
-[1. CONFIG],Base APR,{base_apr_val}
-[1. CONFIG],Range Width,{range_width_val}
-[1. CONFIG],Rebalance Threshold,{rebalance_threshold_val}
-[1. CONFIG],Hedge Mode,{hedge_mode_val}
-[1. CONFIG],Use Safety Net,{use_safety_net_val}
-[1. CONFIG],Safety Net Pct,{safety_net_pct_val}
-[1. CONFIG],Hedge Threshold,{hedge_threshold_val}
-[1. CONFIG],EMA Period,{ema_period_val}
+[1. CONFIG],Seed,{oracle_cfg.seed}
+[1. CONFIG],Base APR,{lp_cfg.base_apr}
+[1. CONFIG],Range Width,{lp_cfg.range_width}
+[1. CONFIG],Rebalance Threshold,{lp_cfg.rebalance_threshold}
+[1. CONFIG],Hedge Mode,{strat_cfg.hedge_mode}
+[1. CONFIG],Use Safety Net,{strat_cfg.use_safety_net}
+[1. CONFIG],Safety Net Pct,{strat_cfg.safety_net_pct}
+[1. CONFIG],Hedge Threshold,{strat_cfg.hedge_threshold}
+[1. CONFIG],EMA Period,{strat_cfg.ema_period}
 [1. CONFIG],Gas Fee USD,{lp_cfg.gas_fee}
 [1. CONFIG],Slippage,{lp_cfg.slippage}
-[1. CONFIG],Perp Taker Fee,{perp_taker_fee_val}
+[1. CONFIG],Perp Taker Fee,{perp_cfg.taker_fee}
 [1. CONFIG],Funding Rate 8H,{funding_rate_8h}
 [1. CONFIG],Harvesting Enabled,{harvest_cfg.get('enabled', False)}
 [1. CONFIG],Harvesting Freq Days,{harvest_cfg.get('withdrawal_freq_days', 0)}
@@ -261,7 +223,6 @@ Category,Metric,Value
 """
     print(csv_output)
 
-    # 9. Plot Results (Dual Lines for Wealth Tracking)
     fig, ax1 = plt.subplots(figsize=(12, 6))
 
     color1 = 'tab:purple'
@@ -269,10 +230,8 @@ Category,Metric,Value
     ax1.set_xlabel('Time (Hours)')
     ax1.set_ylabel('Equity ($)', color=color1, fontweight='bold')
     
-    # เส้นพอร์ตปัจจุบัน (โดนหักเงินถอนออกไปแล้ว)
     ax1.plot(results.index, results['net_equity'], color=color1, label='Live Equity', linewidth=2)
-    # เส้นความมั่งคั่งรวม (ถ้าไม่ได้ถอนออกมาเลยจะอยู่ตรงนี้)
-    ax1.plot(results.index, results['net_equity'] + results['total_withdrawn'], color=color_wealth, label='Total Wealth (Inc. Withdrawals)', linestyle='--', alpha=0.8, linewidth=2)
+    ax1.plot(results.index, wealth_series, color=color_wealth, label='Total Wealth (Inc. Withdrawals)', linestyle='--', alpha=0.8, linewidth=2)
     
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.legend(loc='upper left')
@@ -285,7 +244,7 @@ Category,Metric,Value
     ax2.tick_params(axis='y', labelcolor=color2)
     ax2.legend(loc='lower left')
 
-    plt.title(f"Quant Lab v1.1.5: Wealth Harvesting & Margin Tracking\nCAGR: {cagr:.2f}% | Passive Income: ${total_withdrawn:,.2f} | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold')
+    plt.title(f"Quant Lab v1.2.0: Wealth Harvesting & Margin Tracking\nCAGR: {cagr:.2f}% | Passive Income: ${total_withdrawn:,.2f} | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold')
     fig.tight_layout()
     plt.show()
 

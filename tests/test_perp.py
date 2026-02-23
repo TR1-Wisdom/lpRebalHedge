@@ -40,7 +40,7 @@ class TestPerpModule:
         
         # เปิด Short 2 ETH (Notional = 4000 USD)
         # Fee = 4000 * 0.0005 = 2.0 USD
-        fee = perp.open_position(PositionSide.SHORT, size_in_token=2.0)
+        fee = perp.open_position(PositionSide.SHORT, size_in_token=2.0, cex_wallet_balance=10000.0)
         
         assert fee == 2.0
         assert perp.total_trading_fees == 2.0
@@ -50,7 +50,7 @@ class TestPerpModule:
     def test_unrealized_pnl_mtm(self, perp: PerpModule) -> None:
         """ทดสอบการคำนวณ Unrealized PnL เมื่อราคาวิ่งตามและสวนทาง"""
         perp.update_market_price(2000.0)
-        perp.open_position(PositionSide.LONG, size_in_token=1.0)
+        perp.open_position(PositionSide.LONG, size_in_token=1.0, cex_wallet_balance=10000.0)
         
         # ราคาวิ่งไป 2100 -> Long ต้องกำไร 100
         perp.update_market_price(2100.0)
@@ -63,7 +63,7 @@ class TestPerpModule:
     def test_apply_funding_payment(self, perp: PerpModule) -> None:
         """ทดสอบระบบ Funding Rate (Short ได้เงินเมื่อ Rate บวก)"""
         perp.update_market_price(2000.0)
-        perp.open_position(PositionSide.SHORT, size_in_token=1.0)
+        perp.open_position(PositionSide.SHORT, size_in_token=1.0, cex_wallet_balance=10000.0)
         
         # Funding Rate 0.01% (0.0001) ของ 2000 USD = 0.2 USD
         # ในระบบ PerpModule v1.0.1: payment = notional * rate
@@ -76,7 +76,7 @@ class TestPerpModule:
     def test_close_and_accrue_fee(self, perp: PerpModule) -> None:
         """ทดสอบการปิดสถานะและสะสมค่าธรรมเนียมตอนปิด"""
         perp.update_market_price(2000.0)
-        perp.open_position(PositionSide.SHORT, size_in_token=1.0)
+        perp.open_position(PositionSide.SHORT, size_in_token=1.0, cex_wallet_balance=10000.0)
         
         # ปิดที่ราคาเดิม 2000 -> เสีย Fee อีก 1.0 USD
         close_fee = perp.close_position(PositionSide.SHORT)

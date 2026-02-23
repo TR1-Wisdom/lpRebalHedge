@@ -2,11 +2,10 @@
 src/perp/perp.py
 โมดูล Perp (Perpetual Futures)
 
-ประวัติการแก้ไข:
-- v1.0.3 (Audit Fix): เพิ่มการตรวจสอบ Available Margin ป้องกันการเปิดโพสิชันเกินตัว (Reject Order)
+อัปเดต: v1.0.4 (Audit Fix) เพิ่ม get_total_margin_used()
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 
 from dataclasses import dataclass
 from enum import Enum
@@ -50,19 +49,18 @@ class PerpModule:
             else:
                 pos.unrealized_pnl = pos.size * (pos.entry_price - new_price)
 
-    def open_position(self, side: PositionSide, size_in_token: float, idle_cash: float) -> float:
-        """
-        [Audit Fix 4] รับค่า idle_cash เข้ามาเพื่อเช็คว่ามี Margin เหลือพอให้เปิดไหม
-        หากไม่พอ จะ Raise ValueError เพื่อ Reject Order จำลองการโดนล้างพอร์ตหรือเงินหมด
-        """
+    def get_total_margin_used(self) -> float:
+        """[Audit Fix] ดึง Margin ที่โดนล็อกไว้ทั้งหมดเพื่อส่งให้ Portfolio"""
+        return sum(pos.margin_used for pos in self.positions.values())
+
+    def open_position(self, side: PositionSide, size_in_token: float, cex_wallet_balance: float) -> float:
         notional_value: float = size_in_token * self.current_market_price
         trading_fee: float = notional_value * self.config.taker_fee
         added_margin: float = notional_value / self.config.leverage
 
-        # คำนวณ Available Margin จริงใน CEX (Cash + PnL - Locked Margin)
         total_unrealized_pnl = self.get_total_unrealized_pnl()
-        total_margin_used = sum(p.margin_used for p in self.positions.values())
-        available_margin = idle_cash + total_unrealized_pnl - total_margin_used
+        total_margin_used = self.get_total_margin_used()
+        available_margin = cex_wallet_balance + total_unrealized_pnl - total_margin_used
 
         if available_margin < (added_margin + trading_fee):
             raise ValueError("MARGIN_CALL")
@@ -92,7 +90,6 @@ class PerpModule:
             return 0.0, 0.0
             
         pos = self.positions[side]
-        
         if size_to_close >= pos.size:
             realized_pnl = pos.unrealized_pnl
             fee = self.close_position(side)
