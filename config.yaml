@@ -18,15 +18,15 @@ market:
 # [3] LP Parameters
 lp:
   base_apr: 0.04           
-  range_width: 0.10        
-  rebalance_threshold: 0.30 
+  range_width: 0.10      
+  rebalance_threshold: 0.25 
 
 # [4] Hedge Strategy
 strategy:
   hedge_mode: 'always'     
   use_safety_net: true     
   safety_net_pct: 0.10    
-  hedge_threshold: 0.20  
+  hedge_threshold: 0.10 
   ema_period: 200          
 
 # [5] Fees & Costs
@@ -46,13 +46,20 @@ harvesting:
 # รูปแบบ: [เปิด/ปิด (true/false), ค่าต่ำสุด, ค่าสูงสุด, สเต็ป]
 # หากตั้งเป็น false ระบบจะดึงค่าตั้งต้น (Base) จากหมวดด้านบนมาใช้โดยอัตโนมัติ
 optimization_space:
-  range_width: [true, 0.05, 0.10, 0.05]         # สแกนหาช่วง LP ที่เหมาะสม
-  rebalance_threshold: [true, 0.20, 0.30, 0.05] # สแกนหาจุด Rebalance
-  hedge_threshold: [true, 0.15, 0.25, 0.05]     # สแกนหาจุดปรับ Hedge
+  range_width: [true, 0.05, 0.10, 0.02]         # สแกนหาช่วง LP ที่เหมาะสม
+  rebalance_threshold: [true, 0.10, 0.30, 0.05] # สแกนหาจุด Rebalance
+  hedge_threshold: [true, 0.10, 0.25, 0.05]     # สแกนหาจุดปรับ Hedge
   safety_net_pct: [false, 0.02, 0.1, 0.02]     # (ปิด) ใช้ค่าตั้งต้น
   annual_volatility: [false, 0.40, 0.80, 0.20]   # (ใหม่) ทดสอบความผันผวน 40% ถึง 80%
-  seed: [true, 42, 142, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
+  seed: [true, 42, 72, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
+  freq_da: [true, 5, 30, 15]                   # (ใหม่) ทดสอบความถี่การโยกเงินข้ามพอร์ต 5, 15, 30 วัน
 
 # [8] Execution Settings (NEW)
 execution:
   interval_minutes: 5  # จำลองความหน่วงของ Protocol (เช่น Steer = 15, ทำเองบน VPS = 1)
+
+# [9] Capital Management (NEW)
+# การโยกเงินข้ามพอร์ต (Cross-Margin Sweep) เพื่อรักษาสัดส่วนความเสี่ยง
+capital_management:
+  enabled: true
+  freq_days: 30  # โยกเงินทุกๆ 30 วัน

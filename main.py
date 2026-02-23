@@ -2,11 +2,9 @@
 main.py
 จุดเริ่มรันโปรเจกต์ Inventory LP Backtester
 
-อัปเดตล่าสุด: v1.3.0 (Lag Ready)
-- เพิ่มการดึงค่า execution_interval_minutes จำลองความหน่วง
-- อัปเดต CSV และ Report ให้แสดงค่า Execution Interval
-- ป้องกัน ZeroDivisionError 
-- คุมสถิติ Risk/Reward ด้วย Total Wealth
+อัปเดตล่าสุด: v1.5.0 (Dual Charts Edition)
+- เพิ่มฟังก์ชันวาดกราฟชั้นล่าง (Hedge Dynamics: LP vs Perp)
+- รักษาระบบ Cross-Margin และ CSV Export ไว้ครบถ้วน 100%
 """
 
 import os
@@ -37,7 +35,7 @@ def run_simulation_from_config():
         return
 
     print("="*65)
-    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.3.0 (Lag Ready)")
+    print("🚀 QUANT LAB: Delta Hedge Engine v1.5.0 (Dual Charts Edition)")
     print("="*65)
     
     lp_capital = float(cfg['capital']['lp_capital'])
@@ -54,7 +52,8 @@ def run_simulation_from_config():
         start_price=float(cfg['market']['start_price']), 
         days=days_to_run, 
         annual_volatility=float(cfg['market']['annual_volatility']), 
-        seed=seed_val
+        seed=seed_val,
+        timeframe='5m'
     )
     
     lp_cfg = LPConfig(
@@ -86,11 +85,11 @@ def run_simulation_from_config():
     
     engine = BacktestEngine(oracle, lp, perp, strategy, portfolio)
     data = oracle.generate_data(oracle_cfg)
-    print(f"[*] Generated {len(data)} ticks of market data (5m resolution). Starting Simulation...")
+    print(f"[*] Generated {len(data)} ticks of market data. Starting Simulation...")
     
     harvest_cfg = cfg.get('harvesting', {})
     
-    # [NEW in v1.3.0] ดึงค่า Execution Interval 
+    cross_rebal_cfg = cfg.get('capital_management', {'enabled': True, 'freq_days': 30})
     execution_interval = int(cfg.get('execution', {}).get('interval_minutes', 1))
     
     results = engine.run(
@@ -98,7 +97,8 @@ def run_simulation_from_config():
         strat_cfg, 
         funding_rate=funding_rate_8h, 
         harvest_config=harvest_cfg,
-        execution_interval_min=execution_interval # ส่งค่าความหน่วงเข้าไปที่ Engine
+        cross_rebalance_config=cross_rebal_cfg, 
+        execution_interval_min=execution_interval
     )
     results['price'] = data['close'].values
     
@@ -107,7 +107,6 @@ def run_simulation_from_config():
     total_withdrawn = results['total_withdrawn'].iloc[-1]
     
     min_cex_margin = results['cex_available_margin'].min()
-    # ป้องกัน ZeroDivisionError เผื่อการรันแบบทุน CEX เป็น 0
     min_cex_margin_pct = (min_cex_margin / perp_capital) * 100 if perp_capital > 0 else 0.0
 
     total_wealth = final_equity + total_withdrawn 
@@ -115,9 +114,7 @@ def run_simulation_from_config():
     total_roi = net_profit / initial_equity
     cagr = (pow(1 + total_roi, 365 / days_to_run) - 1) * 100
     
-    # [FIX] เปลี่ยนไปใช้ Total Wealth Series ในการคำนวณ MDD และ Sharpe
     wealth_series = results['net_equity'] + results['total_withdrawn']
-    
     roll_max = wealth_series.cummax()
     drawdown = (wealth_series - roll_max) / roll_max
     max_drawdown = drawdown.min() * 100
@@ -147,7 +144,14 @@ def run_simulation_from_config():
     print("="*65)
     print(f"Total Initial Capital : ${initial_equity:,.2f} (LP: ${lp_capital:,.0f} | CEX: ${perp_capital:,.0f})")
     print(f"Final Net Equity      : ${final_equity:,.2f}")
-    print(f"Total Withdrawn (Cash): ${total_withdrawn:,.2f}  <-- Passive Income 💵")
+    
+    if engine.withdrawal_count > 0:
+        print(f"Total Withdrawn (Cash): ${total_withdrawn:,.2f}  <-- Passive Income 💵")
+        
+    if engine.cross_rebalance_count > 0:
+        print(f"Swept LP -> CEX       : ${engine.total_swept_to_cex:,.2f} 🛡️ (To secure Margin)")
+        print(f"Swept CEX -> LP       : ${engine.total_swept_to_lp:,.2f} 🚜 (To compound Yield)")
+        
     print(f"TOTAL WEALTH CREATED  : ${total_wealth:,.2f}")
     print("-" * 65)
     print(f"Net Profit            : ${net_profit:+,.2f}")
@@ -160,22 +164,13 @@ def run_simulation_from_config():
     print(f"⚙️  STRATEGY & ACTIVITY")
     print("-" * 65)
     print(f"Hedge Mode            : {strat_cfg.hedge_mode.upper()} (Threshold: {strat_cfg.hedge_threshold*100}%)")
-    print(f"Safety Net            : {'ON' if strat_cfg.use_safety_net else 'OFF'} (Trigger: {strat_cfg.safety_net_pct*100}%)")
     print(f"Execution Interval    : {execution_interval} Minutes")
     print(f"LP Multiplier         : {lp.multiplier:.2f}x (Base APR: {lp_cfg.base_apr*100}%)")
-    print(f"Effective APR         : {effective_apr:.2f}%")
     print(f"LP Rebalances         : {lp.rebalance_count} Times")
     print(f"Hedge Trades          : {engine.hedge_count} Times")
-    print(f"Successful Withdrawals: {engine.withdrawal_count} Times")
+    print(f"Cross-Margin Sweeps   : {engine.cross_rebalance_count} Times")
     print(f"Margin Call Rejects   : {len(engine.margin_call_events)} Times 🚨")
     print(f"Min CEX Margin (Low)  : ${min_cex_margin:,.2f} ({min_cex_margin_pct:.2f}%)") 
-
-    if engine.margin_call_events:
-        print("\n" + "🔴 MARGIN CALL ANALYSIS (Worst Cases):")
-        sorted_events = sorted(engine.margin_call_events, key=lambda x: x['margin_needed'] - x['available_margin'], reverse=True)
-        for i, ev in enumerate(sorted_events[:3]):
-            deficit = ev['margin_needed'] - ev['available_margin']
-            print(f" {i+1}. [{ev['timestamp']}] ETH: ${ev['price']:,.0f} | Required: ${ev['margin_needed']:,.0f} | Deficit: -${deficit:,.2f}")
 
     print("\n" + "-"*65)
     print(f"🧮 PNL STATEMENT BREAKDOWN")
@@ -183,10 +178,11 @@ def run_simulation_from_config():
     print(f"Gross LP Yield (Fees) : +${gross_fees:,.2f}")
     print(f"Net Funding Rate      : {('+' if net_funding >= 0 else '')}${net_funding:,.2f}")
     print(f"Trading Costs (Perp)  : -${perp_costs:,.2f}")
-    print(f"Rebalance (Gas+Slip)  : -${rebal_total_costs:,.2f}  (Gas: ${rebal_gas:.0f}, Slip: ${rebal_slip:.0f})")
+    print(f"Rebalance (Gas+Slip)  : -${rebal_total_costs:,.2f}")
     print(f"IL & Residual Risk    : {('+' if delta_pnl >= 0 else '')}${delta_pnl:,.2f}")
     print("="*65)
 
+    # [RESTORED] CSV Output Block
     csv_output = f"""
 \n⬇️ --- COPY BELOW THIS LINE TO EXCEL (CSV Format) --- ⬇️
 Category,Metric,Value
@@ -213,9 +209,13 @@ Category,Metric,Value
 [1. CONFIG],Harvesting Enabled,{harvest_cfg.get('enabled', False)}
 [1. CONFIG],Harvesting Freq Days,{harvest_cfg.get('withdrawal_freq_days', 0)}
 [1. CONFIG],Harvesting Target $,{harvest_cfg.get('target_amount', 0)}
+[1. CONFIG],Cross-Margin Enabled,{cross_rebal_cfg.get('enabled', False)}
+[1. CONFIG],Cross-Margin Freq Days,{cross_rebal_cfg.get('freq_days', 0)}
 [2. WEALTH],Total Initial Capital,{initial_equity:.2f}
 [2. WEALTH],Final Net Equity (Live),{final_equity:.2f}
 [2. WEALTH],Total Withdrawn (Cash),{total_withdrawn:.2f}
+[2. WEALTH],Total Swept LP to CEX,{engine.total_swept_to_cex:.2f}
+[2. WEALTH],Total Swept CEX to LP,{engine.total_swept_to_lp:.2f}
 [2. WEALTH],Total Wealth Created,{total_wealth:.2f}
 [2. WEALTH],Net Profit,{net_profit:.2f}
 [2. WEALTH],Annualized CAGR (%),{cagr:.2f}
@@ -226,6 +226,7 @@ Category,Metric,Value
 [3. STATS],LP Rebalances,{lp.rebalance_count}
 [3. STATS],Hedge Trades,{engine.hedge_count}
 [3. STATS],Withdrawal Count,{engine.withdrawal_count}
+[3. STATS],Cross-Margin Sweeps,{engine.cross_rebalance_count}
 [3. STATS],Margin Call Count,{len(engine.margin_call_events)}
 [3. STATS],Min CEX Margin $,{min_cex_margin:.2f}
 [3. STATS],Min CEX Margin %,{min_cex_margin_pct:.2f}
@@ -238,28 +239,57 @@ Category,Metric,Value
 """
     print(csv_output)
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    # -------------------------------------------------------------
+    # [NEW] การวาดกราฟ 2 ชั้น (Dual Charts: Total vs Component)
+    # -------------------------------------------------------------
+    fig, (ax1, ax3) = plt.subplots(2, 1, figsize=(14, 12), sharex=True, gridspec_kw={'height_ratios': [1.2, 1]})
 
+    # ================= Chart 1: ภาพรวมความมั่งคั่ง =================
     color1 = 'tab:purple'
     color_wealth = 'tab:green'
-    ax1.set_xlabel('Time (Hours)')
-    ax1.set_ylabel('Equity ($)', color=color1, fontweight='bold')
+    ax1.set_ylabel('Total Equity ($)', color=color1, fontweight='bold', fontsize=12)
     
-    ax1.plot(results.index, results['net_equity'], color=color1, label='Live Equity', linewidth=2)
-    ax1.plot(results.index, wealth_series, color=color_wealth, label='Total Wealth (Inc. Withdrawals)', linestyle='--', alpha=0.8, linewidth=2)
+    ax1.plot(results.index, results['net_equity'], color=color1, label='Live Equity', linewidth=2.5)
+    ax1.plot(results.index, wealth_series, color=color_wealth, label='Total Wealth (Inc. Cash)', linestyle='--', alpha=0.8, linewidth=2.5)
     
     ax1.tick_params(axis='y', labelcolor=color1)
-    ax1.legend(loc='upper left')
+    ax1.legend(loc='upper left', fontsize=10)
     ax1.grid(True, linestyle='--', alpha=0.6)
 
     ax2 = ax1.twinx()  
-    color2 = 'tab:gray'
-    ax2.set_ylabel('ETH Price ($)', color=color2, fontweight='bold')  
-    ax2.plot(results.index, results['price'], color=color2, label='ETH Price', linewidth=1, alpha=0.4, linestyle='-.')
-    ax2.tick_params(axis='y', labelcolor=color2)
-    ax2.legend(loc='lower left')
+    color_price = 'tab:gray'
+    ax2.set_ylabel('ETH Price ($)', color=color_price, fontweight='bold', fontsize=12)  
+    ax2.plot(results.index, results['price'], color=color_price, label='ETH Price', linewidth=1.5, alpha=0.5, linestyle='-.')
+    ax2.tick_params(axis='y', labelcolor=color_price)
+    ax2.legend(loc='lower left', fontsize=10)
 
-    plt.title(f"Quant Lab v1.3.0: Lag Simulation ({execution_interval}m)\nCAGR: {cagr:.2f}% | Passive Income: ${total_withdrawn:,.2f} | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold')
+    ax1.set_title(f"Quant Lab: Delta Hedge Engine\nCAGR: {cagr:.2f}% | Max DD: {max_drawdown:.2f}% | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold', fontsize=14)
+
+    # ================= Chart 2: ชำแหละไส้ใน (LP vs Perp) =================
+    color_lp = '#10b981' # เขียวมรกต (LP)
+    color_perp = '#3b82f6' # สีฟ้า (Perp)
+    
+    ax3.set_xlabel('Time (Ticks)', fontweight='bold', fontsize=12)
+    ax3.set_ylabel('Component Equity ($)', fontweight='bold', fontsize=12)
+    
+    # คำนวณมูลค่า Perp (เงินสดใน CEX + PnL ของออเดอร์)
+    perp_equity_series = results['cex_wallet_balance'] + results['perp_pnl']
+    
+    ax3.plot(results.index, results['lp_value'], color=color_lp, label='LP Equity (On-chain)', linewidth=2)
+    ax3.plot(results.index, perp_equity_series, color=color_perp, label='Perp Margin (CEX)', linewidth=2)
+    
+    ax3.tick_params(axis='y')
+    ax3.legend(loc='upper left', fontsize=10)
+    ax3.grid(True, linestyle='--', alpha=0.6)
+
+    ax4 = ax3.twinx()  
+    ax4.set_ylabel('ETH Price ($)', color=color_price, fontweight='bold', fontsize=12)  
+    ax4.plot(results.index, results['price'], color=color_price, label='ETH Price', linewidth=1.5, alpha=0.5, linestyle='-.')
+    ax4.tick_params(axis='y', labelcolor=color_price)
+    ax4.legend(loc='lower left', fontsize=10)
+    
+    ax3.set_title("Hedge Engine Dynamics (LP vs CEX) - The 'Mirror' Effect", fontweight='bold', fontsize=12)
+
     fig.tight_layout()
     plt.show()
 
