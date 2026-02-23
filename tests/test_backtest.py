@@ -18,7 +18,7 @@ from src.oracle.oracle import OracleModule, OracleConfig
 from src.lp.lp import LPModule, LPConfig
 from src.perp.perp import PerpModule, PerpConfig
 from src.strategy.strategy import StrategyModule, StrategyConfig
-from src.portfolio.portfolio import PortfolioModule
+from src.portfolio.portfolio import PortfolioModule, TransactionType
 from src.engine.backtest_engine import BacktestEngine
 
 class TestBacktestEngine:
@@ -63,6 +63,33 @@ class TestBacktestEngine:
         calculated_net_equity = final_state['lp_value'] + final_state['cex_wallet_balance'] + final_state['perp_pnl']
         
         assert abs(final_state['net_equity'] - calculated_net_equity) < 1e-5, "สมการ Net Equity ขัดแย้งกัน เงินหล่นหาย!"
+
+
+    def test_funding_applies_once_per_8h_interval_on_subhour_data(self) -> None:
+        """ยืนยันว่า timeframe ย่อย (15m) จะไม่โดนคิด Funding ซ้ำในชั่วโมงเดียวกัน"""
+        capital = 10000.0
+        oracle_cfg = OracleConfig(start_price=2000.0, days=1, annual_volatility=0.0, seed=7, timeframe='15min')
+        lp_cfg = LPConfig(initial_capital=capital, range_width=0.10, rebalance_threshold=0.99, daily_volume=0.0)
+        perp_cfg = PerpConfig(leverage=1.0)
+
+        oracle = OracleModule()
+        lp = LPModule(lp_cfg, oracle_cfg.start_price)
+        perp = PerpModule(perp_cfg)
+        strategy = StrategyModule(lp, perp)
+        portfolio = PortfolioModule(capital)
+        engine = BacktestEngine(oracle, lp, perp, strategy, portfolio)
+
+        df_feed = oracle.generate_data(oracle_cfg)
+        strat_cfg = StrategyConfig(ema_period=5, hedge_mode='always', use_safety_net=False, hedge_threshold=0.0)
+        engine.run(df_feed, strat_cfg, funding_rate=0.0001)
+
+        funding_revenue = portfolio.ledgers[TransactionType.REVENUE_FUNDING]
+
+        # 1 วันต้องเกิด funding 3 รอบที่ชั่วโมง 8, 16, 24
+        short_notional = perp.get_short_position_size() * oracle_cfg.start_price
+        expected_single_payment = short_notional * 0.0001
+
+        assert funding_revenue == pytest.approx(expected_single_payment * 3)
 
     def test_margin_call_logging_deficit(self, setup_components: tuple) -> None:
         """[Audit Fix] ทดสอบว่า Engine บันทึก Margin Deficit ได้ถูกต้อง (รวม Fee แล้ว)"""
