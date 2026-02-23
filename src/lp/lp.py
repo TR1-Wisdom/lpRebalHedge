@@ -115,21 +115,23 @@ class LPModule:
             self.skew = 1.0 - ((self.current_price - self.range_lower) / range_size)
 
     def collect_fee(self) -> float:
-        """คำนวณและเก็บสะสมรายได้จากค่าธรรมเนียม (Trading Fee) ประจำชั่วโมง"""
+        """คำนวณและเก็บสะสมรายได้จากค่าธรรมเนียม (Trading Fee) ประจำ Tick (5 นาที)"""
         if self.range_lower < self.current_price < self.range_upper:
-            # ใช้โหมด Base APR ตามที่ User ต้องการ (คำนวณผลตอบแทนรายชั่วโมง)
+            # ปรับฐานการคำนวณจากรายชั่วโมงเป็นราย Tick (1 แท่ง = 5 นาที)
+            ticks_per_year = (365.0 * 24.0 * 12.0) # 12 แท่งต่อชั่วโมง
+            
             if self.config.fee_mode == 'base_apr':
                 effective_apr = self.config.base_apr * self.multiplier
-                hourly_fee = self.position_value * (effective_apr / (365.0 * 24.0))
+                tick_fee = self.position_value * (effective_apr / ticks_per_year)
             else:
-                # โหมด Volume เดิม
+                # โหมด Volume เดิม (ปรับให้เป็น 5 นาที)
                 base_share = self.position_value / self.config.pool_tvl
-                volume_share = self.config.daily_volume / 24.0
-                hourly_fee = base_share * volume_share * self.config.fee_tier * self.multiplier
+                volume_share = self.config.daily_volume / (24.0 * 12.0)
+                tick_fee = base_share * volume_share * self.config.fee_tier * self.multiplier
             
-            self.position_value += hourly_fee
-            self.accumulated_fees += hourly_fee
-            return hourly_fee
+            self.position_value += tick_fee
+            self.accumulated_fees += tick_fee
+            return tick_fee
             
         return 0.0
 
