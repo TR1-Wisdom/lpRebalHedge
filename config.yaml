@@ -12,21 +12,21 @@ capital:
 market:
   start_price: 2000.0      
   days_to_run: 360         
-  annual_volatility: 0.50  
+  annual_volatility: 0.70  
   seed: 42                 
 
 # [3] LP Parameters
 lp:
   base_apr: 0.04           
   range_width: 0.10        
-  rebalance_threshold: 0.25 
+  rebalance_threshold: 0.30 
 
 # [4] Hedge Strategy
 strategy:
   hedge_mode: 'always'     
   use_safety_net: true     
-  safety_net_pct: 0.03     
-  hedge_threshold: 0.20    
+  safety_net_pct: 0.10    
+  hedge_threshold: 0.20  
   ema_period: 200          
 
 # [5] Fees & Costs
@@ -37,7 +37,18 @@ costs:
   funding_rate_8h: 0.0001  
 
 # [6] Passive Income (NEW FEATURE)
-harvesting:
-  enabled: true             # เปิด/ปิด ระบบถอนเงิน
+harvesting: 
+  enabled: false             # เปิด/ปิด ระบบถอนเงิน true/false
   withdrawal_freq_days: 30  # ถอนทุกๆกี่วัน
   target_amount: 500.0      # จำนวนเงินที่ตั้งเป้าจะถอน (USD)
+
+# [7] Optimization Space (NEW)
+# รูปแบบ: [เปิด/ปิด (true/false), ค่าต่ำสุด, ค่าสูงสุด, สเต็ป]
+# หากตั้งเป็น false ระบบจะดึงค่าตั้งต้น (Base) จากหมวดด้านบนมาใช้โดยอัตโนมัติ
+optimization_space:
+  range_width: [true, 0.05, 0.10, 0.05]         # สแกนหาช่วง LP ที่เหมาะสม
+  rebalance_threshold: [true, 0.20, 0.30, 0.05] # สแกนหาจุด Rebalance
+  hedge_threshold: [true, 0.15, 0.25, 0.05]     # สแกนหาจุดปรับ Hedge
+  safety_net_pct: [false, 0.02, 0.1, 0.02]     # (ปิด) ใช้ค่าตั้งต้น
+  annual_volatility: [false, 0.40, 0.80, 0.20]   # (ใหม่) ทดสอบความผันผวน 40% ถึง 80%
+  seed: [true, 42, 142, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
