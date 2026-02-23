@@ -1,12 +1,10 @@
 """
 src/engine/backtest_engine.py
-โมดูล Backtest Engine
-
-อัปเดต: v1.2.1 (Audit Fix) 
-- แก้ไขสมการคำนวณ Deficit ตอนเกิด MARGIN_CALL ให้รวม trading_fee ด้วย
+อัปเดต: v1.3.0 (Lag Simulation)
+- เพิ่มระบบ Execution Interval เพื่อจำลองความล่าช้าในการ Rebalance/Hedge
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import pandas as pd
 from typing import List, Dict, Any
@@ -40,14 +38,15 @@ class BacktestEngine:
 
     def run(self, data_feed: pd.DataFrame, strategy_config: StrategyConfig, 
             funding_rate: float = 0.0001, 
-            harvest_config: Dict[str, Any] = None) -> pd.DataFrame:
+            harvest_config: Dict[str, Any] = None,
+            execution_interval_min: int = 1) -> pd.DataFrame:
             
         df = self.strategy.populate_indicators(data_feed, strategy_config)
         df = self.strategy.populate_signals(df)
 
         history: List[PortfolioState] = []
-        funding_interval = timedelta(hours=8)
-        next_funding_time: datetime = df['date'].iloc[0] + funding_interval
+        last_execution_time: datetime = datetime(1970, 1, 1) # เก็บเวลาที่รันล่าสุด
+        last_funding_time: datetime = df['date'].iloc[0]
         
         last_withdrawal_date = df['date'].iloc[0]
         withdraw_enabled = harvest_config.get('enabled', False) if harvest_config else False
@@ -59,57 +58,68 @@ class BacktestEngine:
             current_price: float = row['close']
             rebalanced_this_tick = False
 
+            # อัปเดตราคาตลาดทุกวินาที (PnL วิ่งตลอดเวลา)
             self.lp.update_price(current_price)
             self.perp.update_market_price(current_price)
 
-            lp_fee: float = self.lp.collect_fee()
-            if lp_fee > 0:
-                self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
+            # --- CHECK EXECUTION INTERVAL ---
+            # จะตัดสินใจเทรดหรือปรับพอร์ตได้เฉพาะเมื่อครบรอบนาทีที่กำหนดเท่านั้น
+            can_execute = (current_time - last_execution_time).total_seconds() >= (execution_interval_min * 60)
 
-            rebalance_res = self.lp.check_and_rebalance()
-            if rebalance_res.is_rebalanced:
-                self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebalance_res.gas_cost)
-                self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebalance_res.slippage_cost)
-                rebalanced_this_tick = True
+            if can_execute:
+                # 1. Collect Fees (ทำตามรอบ)
+                lp_fee: float = self.lp.collect_fee()
+                if lp_fee > 0:
+                    self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
 
-            if not pd.isna(row['signal']):
-                orders = self.strategy.generate_orders(row, strategy_config)
-                for order in orders:
-                    try:
-                        if order.action in ['HEDGE_ON', 'ADJUST_HEDGE']:
-                            current_short = self.perp.get_short_position_size()
-                            diff: float = order.target_size - current_short
-                            
-                            if diff > 0: 
-                                fee = self.perp.open_position(PositionSide.SHORT, diff, self.portfolio.cex_wallet_balance)
-                                self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                                self.hedge_count += 1
-                            elif diff < 0 and order.action == 'ADJUST_HEDGE':
-                                size_to_close = abs(diff)
-                                realized_pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, size_to_close)
-                                self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
-                                self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                                self.hedge_count += 1
+                # 2. Rebalance LP (ทำตามรอบ)
+                rebalance_res = self.lp.check_and_rebalance()
+                if rebalance_res.is_rebalanced:
+                    self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebalance_res.gas_cost)
+                    self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebalance_res.slippage_cost)
+                    rebalanced_this_tick = True
+
+                # 3. Hedge Strategy (ทำตามรอบ - นี่คือจุดที่อันตรายถ้า interval_min สูง)
+                if not pd.isna(row['signal']):
+                    orders = self.strategy.generate_orders(row, strategy_config)
+                    for order in orders:
+                        try:
+                            if order.action in ['HEDGE_ON', 'ADJUST_HEDGE']:
+                                current_short = self.perp.get_short_position_size()
+                                diff: float = order.target_size - current_short
                                 
-                        elif order.action == 'HEDGE_OFF':
-                            self._close_all_shorts()
+                                if diff > 0: 
+                                    fee = self.perp.open_position(PositionSide.SHORT, diff, self.portfolio.cex_wallet_balance)
+                                    self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                                    self.hedge_count += 1
+                                elif diff < 0 and order.action == 'ADJUST_HEDGE':
+                                    size_to_close = abs(diff)
+                                    realized_pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, size_to_close)
+                                    self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
+                                    self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                                    self.hedge_count += 1
+                                    
+                            elif order.action == 'HEDGE_OFF':
+                                self._close_all_shorts()
 
-                    except ValueError as e:
-                        if str(e) == "MARGIN_CALL":
-                            # [KEY FIX] เพิ่ม trading_fee เข้าไปใน margin_needed ให้ตรงกับตรรกะของ PerpModule
-                            notional_needed = abs(order.target_size - self.perp.get_short_position_size()) * current_price
-                            trading_fee = notional_needed * self.perp.config.taker_fee
-                            margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
-                            
-                            available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
-                            
-                            self.margin_call_events.append({
-                                'timestamp': current_time,
-                                'price': current_price,
-                                'available_margin': available_margin,
-                                'margin_needed': margin_needed
-                            })
+                        except ValueError as e:
+                            if str(e) == "MARGIN_CALL":
+                                notional_needed = abs(order.target_size - self.perp.get_short_position_size()) * current_price
+                                trading_fee = notional_needed * self.perp.config.taker_fee
+                                margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
+                                
+                                available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
+                                
+                                self.margin_call_events.append({
+                                    'timestamp': current_time,
+                                    'price': current_price,
+                                    'available_margin': available_margin,
+                                    'margin_needed': margin_needed
+                                })
 
+                last_execution_time = current_time # อัปเดตเวลาที่รันล่าสุด
+
+            # 4. Withdraw Passive Income (ตรวจสอบหลัง Rebalance)
             if withdraw_enabled and rebalanced_this_tick:
                 days_since_last = (current_time - last_withdrawal_date).days
                 if days_since_last >= withdraw_freq:
@@ -122,22 +132,21 @@ class BacktestEngine:
                         self.withdrawal_count += 1
                         last_withdrawal_date = current_time
 
-            if current_time >= next_funding_time:
-                elapsed_periods = int((current_time - next_funding_time) // funding_interval) + 1
-                for _ in range(elapsed_periods):
-                    funding_pnl: float = self.perp.apply_funding(funding_rate)
-                    if funding_pnl > 0:
-                        self.portfolio.record_transaction(TransactionType.REVENUE_FUNDING, funding_pnl)
-                    elif funding_pnl < 0:
-                        self.portfolio.record_transaction(TransactionType.EXPENSE_FUNDING, funding_pnl)
+            # 5. Funding Rate Calculation (ทุก 8 ชั่วโมง)
+            if current_time.hour % 8 == 0 and current_time != last_funding_time:
+                funding_pnl: float = self.perp.apply_funding(funding_rate)
+                if funding_pnl > 0:
+                    self.portfolio.record_transaction(TransactionType.REVENUE_FUNDING, funding_pnl)
+                elif funding_pnl < 0:
+                    self.portfolio.record_transaction(TransactionType.EXPENSE_FUNDING, funding_pnl)
+                last_funding_time = current_time
 
-                next_funding_time = next_funding_time + (funding_interval * elapsed_periods)
-
+            # 6. บันทึก Portfolio State ลงประวัติ
             state: PortfolioState = self.portfolio.get_state(
                 current_time, 
                 self.lp.position_value, 
                 self.perp.get_total_unrealized_pnl(),
-                self.perp.get_total_margin_used() # ส่ง margin เข้าไป
+                self.perp.get_total_margin_used() 
             )
             history.append(state)
 

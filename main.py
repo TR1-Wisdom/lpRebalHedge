@@ -2,8 +2,11 @@
 main.py
 จุดเริ่มรันโปรเจกต์ Inventory LP Backtester
 
-อัปเดตล่าสุด: v1.2.1 (Safety & Audit Fix)
-- [FIX] ป้องกัน ZeroDivisionError กรณีตั้ง perp_capital = 0
+อัปเดตล่าสุด: v1.3.0 (Lag Ready)
+- เพิ่มการดึงค่า execution_interval_minutes จำลองความหน่วง
+- อัปเดต CSV และ Report ให้แสดงค่า Execution Interval
+- ป้องกัน ZeroDivisionError 
+- คุมสถิติ Risk/Reward ด้วย Total Wealth
 """
 
 import os
@@ -34,7 +37,7 @@ def run_simulation_from_config():
         return
 
     print("="*65)
-    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.2.1 (Stable)")
+    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.3.0 (Lag Ready)")
     print("="*65)
     
     lp_capital = float(cfg['capital']['lp_capital'])
@@ -86,7 +89,17 @@ def run_simulation_from_config():
     print(f"[*] Generated {len(data)} hours of price data. Starting Simulation...")
     
     harvest_cfg = cfg.get('harvesting', {})
-    results = engine.run(data, strat_cfg, funding_rate=funding_rate_8h, harvest_config=harvest_cfg)
+    
+    # [NEW in v1.3.0] ดึงค่า Execution Interval 
+    execution_interval = int(cfg.get('execution', {}).get('interval_minutes', 1))
+    
+    results = engine.run(
+        data, 
+        strat_cfg, 
+        funding_rate=funding_rate_8h, 
+        harvest_config=harvest_cfg,
+        execution_interval_min=execution_interval # ส่งค่าความหน่วงเข้าไปที่ Engine
+    )
     results['price'] = data['close'].values
     
     initial_equity = total_capital 
@@ -94,7 +107,7 @@ def run_simulation_from_config():
     total_withdrawn = results['total_withdrawn'].iloc[-1]
     
     min_cex_margin = results['cex_available_margin'].min()
-    # [KEY FIX] ป้องกันการหารด้วยศูนย์ กรณีอยากทดสอบแบบปล่อย Naked LP (perp_capital = 0)
+    # ป้องกัน ZeroDivisionError เผื่อการรันแบบทุน CEX เป็น 0
     min_cex_margin_pct = (min_cex_margin / perp_capital) * 100 if perp_capital > 0 else 0.0
 
     total_wealth = final_equity + total_withdrawn 
@@ -102,7 +115,7 @@ def run_simulation_from_config():
     total_roi = net_profit / initial_equity
     cagr = (pow(1 + total_roi, 365 / days_to_run) - 1) * 100
     
-    # [KEY FIX] เปลี่ยนไปใช้ Total Wealth Series ในการคำนวณ MDD และ Sharpe
+    # [FIX] เปลี่ยนไปใช้ Total Wealth Series ในการคำนวณ MDD และ Sharpe
     wealth_series = results['net_equity'] + results['total_withdrawn']
     
     roll_max = wealth_series.cummax()
@@ -140,7 +153,7 @@ def run_simulation_from_config():
     print(f"Net Profit            : ${net_profit:+,.2f}")
     print(f"Raw ROI               : {total_roi*100:+.2f}%")
     print(f"Annualized CAGR       : {cagr:+.2f}%")
-    print(f"Max Drawdown (Wealth) : {max_drawdown:.2f}%") # แสดงกำกับชัดเจนว่ามาจาก Wealth
+    print(f"Max Drawdown (Wealth) : {max_drawdown:.2f}%") 
     print(f"Sharpe Ratio          : {sharpe:.2f}")
     
     print("\n" + "-"*65)
@@ -148,6 +161,7 @@ def run_simulation_from_config():
     print("-" * 65)
     print(f"Hedge Mode            : {strat_cfg.hedge_mode.upper()} (Threshold: {strat_cfg.hedge_threshold*100}%)")
     print(f"Safety Net            : {'ON' if strat_cfg.use_safety_net else 'OFF'} (Trigger: {strat_cfg.safety_net_pct*100}%)")
+    print(f"Execution Interval    : {execution_interval} Minutes")
     print(f"LP Multiplier         : {lp.multiplier:.2f}x (Base APR: {lp_cfg.base_apr*100}%)")
     print(f"Effective APR         : {effective_apr:.2f}%")
     print(f"LP Rebalances         : {lp.rebalance_count} Times")
@@ -191,6 +205,7 @@ Category,Metric,Value
 [1. CONFIG],Safety Net Pct,{strat_cfg.safety_net_pct}
 [1. CONFIG],Hedge Threshold,{strat_cfg.hedge_threshold}
 [1. CONFIG],EMA Period,{strat_cfg.ema_period}
+[1. CONFIG],Execution Interval Min,{execution_interval}
 [1. CONFIG],Gas Fee USD,{lp_cfg.gas_fee}
 [1. CONFIG],Slippage,{lp_cfg.slippage}
 [1. CONFIG],Perp Taker Fee,{perp_cfg.taker_fee}
@@ -244,7 +259,7 @@ Category,Metric,Value
     ax2.tick_params(axis='y', labelcolor=color2)
     ax2.legend(loc='lower left')
 
-    plt.title(f"Quant Lab v1.2.0: Wealth Harvesting & Margin Tracking\nCAGR: {cagr:.2f}% | Passive Income: ${total_withdrawn:,.2f} | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold')
+    plt.title(f"Quant Lab v1.3.0: Lag Simulation ({execution_interval}m)\nCAGR: {cagr:.2f}% | Passive Income: ${total_withdrawn:,.2f} | Margin Calls: {len(engine.margin_call_events)}", fontweight='bold')
     fig.tight_layout()
     plt.show()
 

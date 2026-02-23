@@ -52,3 +52,7 @@ optimization_space:
   safety_net_pct: [false, 0.02, 0.1, 0.02]     # (ปิด) ใช้ค่าตั้งต้น
   annual_volatility: [false, 0.40, 0.80, 0.20]   # (ใหม่) ทดสอบความผันผวน 40% ถึง 80%
   seed: [true, 42, 142, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
+
+# [8] Execution Settings (NEW)
+execution:
+  interval_minutes: 30  # จำลองความหน่วงของ Protocol (เช่น Steer = 15, ทำเองบน VPS = 1)
