@@ -46,7 +46,8 @@ class BacktestEngine:
         df = self.strategy.populate_signals(df)
 
         history: List[PortfolioState] = []
-        last_funding_time: datetime = df['date'].iloc[0]
+        funding_interval = timedelta(hours=8)
+        next_funding_time: datetime = df['date'].iloc[0] + funding_interval
         
         last_withdrawal_date = df['date'].iloc[0]
         withdraw_enabled = harvest_config.get('enabled', False) if harvest_config else False
@@ -121,13 +122,16 @@ class BacktestEngine:
                         self.withdrawal_count += 1
                         last_withdrawal_date = current_time
 
-            if current_time.hour % 8 == 0 and current_time != last_funding_time:
-                funding_pnl: float = self.perp.apply_funding(funding_rate)
-                if funding_pnl > 0:
-                    self.portfolio.record_transaction(TransactionType.REVENUE_FUNDING, funding_pnl)
-                elif funding_pnl < 0:
-                    self.portfolio.record_transaction(TransactionType.EXPENSE_FUNDING, funding_pnl)
-                last_funding_time = current_time
+            if current_time >= next_funding_time:
+                elapsed_periods = int((current_time - next_funding_time) // funding_interval) + 1
+                for _ in range(elapsed_periods):
+                    funding_pnl: float = self.perp.apply_funding(funding_rate)
+                    if funding_pnl > 0:
+                        self.portfolio.record_transaction(TransactionType.REVENUE_FUNDING, funding_pnl)
+                    elif funding_pnl < 0:
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_FUNDING, funding_pnl)
+
+                next_funding_time = next_funding_time + (funding_interval * elapsed_periods)
 
             state: PortfolioState = self.portfolio.get_state(
                 current_time, 
