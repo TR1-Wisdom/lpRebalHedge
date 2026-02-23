@@ -9,9 +9,10 @@ risk_calculator.py
 import os
 import yaml
 import math
+from typing import Any
 from scipy.stats import norm
 
-def load_config(file_path: str = 'config.yaml') -> dict:
+def load_config(file_path: str = 'config.yaml') -> dict[str, Any]:
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"⚠️ ไม่พบไฟล์ตั้งค่า: {file_path}")
     with open(file_path, 'r', encoding='utf-8') as file:
