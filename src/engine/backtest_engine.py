@@ -1,10 +1,11 @@
 """
 src/engine/backtest_engine.py
-อัปเดต: v1.3.1 (Emergency Rescue Edition)
-- เพิ่มระบบ Emergency Margin Rescue ดึงกำไรจาก LP มาช่วย CEX อัตโนมัติ
+อัปเดต: v1.4.0 (Cross-Margin Sweep)
+- แก้บั๊กการถอนเงิน (Passive Income) ดื้อแพ่งเมื่อตั้ง false
+- เพิ่มระบบโอนเงินข้ามพอร์ตอัตโนมัติ (LP <-> CEX) ทุกๆ X วัน
 """
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 import pandas as pd
 from typing import List, Dict, Any
@@ -35,10 +36,16 @@ class BacktestEngine:
         self.margin_call_events: List[Dict[str, Any]] = [] 
         self.withdrawal_count = 0
         self.lp_initial_capital = lp.config.initial_capital
+        
+        # [NEW] Counters for Cross-Margin Sweep
+        self.cross_rebalance_count = 0
+        self.total_swept_to_cex = 0.0
+        self.total_swept_to_lp = 0.0
 
     def run(self, data_feed: pd.DataFrame, strategy_config: StrategyConfig, 
             funding_rate: float = 0.0001, 
             harvest_config: Dict[str, Any] = None,
+            cross_rebalance_config: Dict[str, Any] = None,
             execution_interval_min: int = 1) -> pd.DataFrame:
             
         df = self.strategy.populate_indicators(data_feed, strategy_config)
@@ -47,11 +54,18 @@ class BacktestEngine:
         history: List[PortfolioState] = []
         last_execution_time: datetime = datetime(1970, 1, 1) 
         last_funding_time: datetime = df['date'].iloc[0]
+        last_cap_rebal_date = df['date'].iloc[0]
         
         last_withdrawal_date = df['date'].iloc[0]
-        withdraw_enabled = harvest_config.get('enabled', False) if harvest_config else False
+        
+        # [FIX] บังคับแปลงค่า YAML เป็น string แล้วเช็คคำว่า 'true' ป้องกันบั๊ก String "false"
+        withdraw_enabled = str(harvest_config.get('enabled', 'false')).lower() == 'true' if harvest_config else False
         withdraw_freq = harvest_config.get('withdrawal_freq_days', 30) if harvest_config else 30
         withdraw_target = harvest_config.get('target_amount', 0) if harvest_config else 0
+        
+        # [NEW] Capital Sweep Config
+        cap_rebal_enabled = str(cross_rebalance_config.get('enabled', 'true')).lower() == 'true' if cross_rebalance_config else False
+        cap_rebal_freq = cross_rebalance_config.get('freq_days', 30) if cross_rebalance_config else 30
 
         for _, row in df.iterrows():
             current_time: datetime = row['date']
@@ -98,7 +112,6 @@ class BacktestEngine:
 
                         except ValueError as e:
                             if str(e) == "MARGIN_CALL":
-                                # --- [KEY FIX] EMERGENCY MARGIN RESCUE ---
                                 current_short_size = self.perp.get_short_position_size()
                                 target_diff = order.target_size - current_short_size
                                 
@@ -107,28 +120,23 @@ class BacktestEngine:
                                 margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
                                 
                                 available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
-                                deficit = (margin_needed - available_margin) + 20.0 # ขอเติมเผื่อไว้ 20$
+                                deficit = (margin_needed - available_margin) + 20.0 
                                 
                                 current_lp_profit = self.lp.position_value - self.lp_initial_capital
                                 
-                                # ถ้า LP มีกำไรมากพอที่จะอุ้ม CEX ได้
                                 if current_lp_profit > deficit and deficit > 0:
-                                    # โอนกำไรข้ามพอร์ต
                                     self.lp.position_value -= deficit
                                     self.portfolio.record_transaction(TransactionType.WITHDRAWAL, -deficit)
                                     self.portfolio.record_transaction(TransactionType.DEPOSIT, deficit)
-                                    
-                                    # ยิงคำสั่ง Hedge ซ้ำอีกรอบ
                                     try:
                                         if target_diff > 0:
                                             fee = self.perp.open_position(PositionSide.SHORT, target_diff, self.portfolio.cex_wallet_balance)
                                             self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
                                             self.hedge_count += 1
-                                        continue # รอดตาย! ข้ามการบันทึก Margin Call ทิ้งไปเลย
+                                        continue 
                                     except ValueError:
                                         pass
                                 
-                                # ถ้า LP ก็ขาดทุนจนช่วยไม่ไหว ค่อยยอมรับสภาพพอร์ตแตก
                                 self.margin_call_events.append({
                                     'timestamp': current_time,
                                     'price': current_price,
@@ -137,7 +145,42 @@ class BacktestEngine:
                                 })
 
                 last_execution_time = current_time 
+                
+            # [NEW] 7. Cross-Portfolio Capital Sweep (โยกเงินรักษาสมดุล)
+            if cap_rebal_enabled:
+                if (current_time - last_cap_rebal_date).total_seconds() >= (cap_rebal_freq * 86400):
+                    current_lp = self.lp.position_value
+                    current_perp_pnl = self.perp.get_total_unrealized_pnl()
+                    current_cex = self.portfolio.cex_wallet_balance + current_perp_pnl
+                    total_eq = current_lp + current_cex
+                    
+                    # คำนวณสัดส่วนตั้งต้น
+                    initial_lp = self.lp_initial_capital
+                    initial_cex = self.portfolio.initial_capital - self.lp_initial_capital
+                    initial_total = initial_lp + initial_cex
+                    
+                    target_lp = total_eq * (initial_lp / initial_total)
+                    transfer_to_cex = current_lp - target_lp
+                    
+                    if transfer_to_cex > 0:
+                        # Sweep จาก LP ไป CEX
+                        self.lp.position_value -= transfer_to_cex
+                        self.portfolio.cex_wallet_balance += transfer_to_cex
+                        self.total_swept_to_cex += transfer_to_cex
+                        self.cross_rebalance_count += 1
+                    elif transfer_to_cex < 0:
+                        # Sweep จาก CEX กลับไป LP
+                        available_in_cex = self.portfolio.cex_wallet_balance + current_perp_pnl - self.perp.get_total_margin_used()
+                        actual_transfer = min(abs(transfer_to_cex), available_in_cex)
+                        if actual_transfer > 0:
+                            self.portfolio.cex_wallet_balance -= actual_transfer
+                            self.lp.position_value += actual_transfer
+                            self.total_swept_to_lp += actual_transfer
+                            self.cross_rebalance_count += 1
+                            
+                    last_cap_rebal_date = current_time
 
+            # Passive Income (ถ้าเปิดไว้)
             if withdraw_enabled and rebalanced_this_tick:
                 days_since_last = (current_time - last_withdrawal_date).days
                 if days_since_last >= withdraw_freq:
