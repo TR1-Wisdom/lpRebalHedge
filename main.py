@@ -2,9 +2,8 @@
 main.py
 จุดเริ่มรันโปรเจกต์ Inventory LP Backtester
 
-อัปเดตล่าสุด: v1.2.0 (Stable Release)
-- [FIX] คำนวณ Sharpe Ratio และ Max Drawdown จาก Total Wealth เพื่อป้องกันค่าสถิติเพี้ยนจากการถอนเงิน
-- Freeze version สำหรับเตรียมนำไปใช้ทำ Optimization
+อัปเดตล่าสุด: v1.2.1 (Safety & Audit Fix)
+- [FIX] ป้องกัน ZeroDivisionError กรณีตั้ง perp_capital = 0
 """
 
 import os
@@ -35,7 +34,7 @@ def run_simulation_from_config():
         return
 
     print("="*65)
-    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.2.0 (Stable)")
+    print("🚀 QUANT LAB: Delta Hedge Backtest Engine v1.2.1 (Stable)")
     print("="*65)
     
     lp_capital = float(cfg['capital']['lp_capital'])
@@ -95,7 +94,8 @@ def run_simulation_from_config():
     total_withdrawn = results['total_withdrawn'].iloc[-1]
     
     min_cex_margin = results['cex_available_margin'].min()
-    min_cex_margin_pct = (min_cex_margin / perp_capital) * 100
+    # [KEY FIX] ป้องกันการหารด้วยศูนย์ กรณีอยากทดสอบแบบปล่อย Naked LP (perp_capital = 0)
+    min_cex_margin_pct = (min_cex_margin / perp_capital) * 100 if perp_capital > 0 else 0.0
 
     total_wealth = final_equity + total_withdrawn 
     net_profit = total_wealth - initial_equity

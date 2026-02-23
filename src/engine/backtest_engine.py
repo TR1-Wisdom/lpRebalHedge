@@ -2,12 +2,11 @@
 src/engine/backtest_engine.py
 โมดูล Backtest Engine
 
-อัปเดต: v1.0.7 (Audit Fix) 
-- แก้ไขสมการคำนวณ Deficit ตอนเกิด MARGIN_CALL ให้หัก margin_used
-- ส่งค่า margin_used ไปบันทึกใน PortfolioState
+อัปเดต: v1.2.1 (Audit Fix) 
+- แก้ไขสมการคำนวณ Deficit ตอนเกิด MARGIN_CALL ให้รวม trading_fee ด้วย
 """
 
-__version__ = "1.0.7"
+__version__ = "1.2.1"
 
 import pandas as pd
 from typing import List, Dict, Any
@@ -96,9 +95,10 @@ class BacktestEngine:
 
                     except ValueError as e:
                         if str(e) == "MARGIN_CALL":
-                            # [KEY FIX] สูตรที่ตรงกับ PerpModule.open_position() เป๊ะๆ
+                            # [KEY FIX] เพิ่ม trading_fee เข้าไปใน margin_needed ให้ตรงกับตรรกะของ PerpModule
                             notional_needed = abs(order.target_size - self.perp.get_short_position_size()) * current_price
-                            margin_needed = notional_needed / self.perp.config.leverage
+                            trading_fee = notional_needed * self.perp.config.taker_fee
+                            margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
                             
                             available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
                             

@@ -63,3 +63,22 @@ class TestBacktestEngine:
         calculated_net_equity = final_state['lp_value'] + final_state['cex_wallet_balance'] + final_state['perp_pnl']
         
         assert abs(final_state['net_equity'] - calculated_net_equity) < 1e-5, "สมการ Net Equity ขัดแย้งกัน เงินหล่นหาย!"
+
+    def test_margin_call_logging_deficit(self, setup_components: tuple) -> None:
+        """[Audit Fix] ทดสอบว่า Engine บันทึก Margin Deficit ได้ถูกต้อง (รวม Fee แล้ว)"""
+        engine, df_feed, strat_cfg = setup_components
+        
+        # ดึงเงินออกจาก CEX ให้เหลือน้อยมากๆ (เช่น 10$) เพื่อบังคับให้เกิด Margin Call ทันทีที่สั่ง Hedge
+        engine.portfolio.cex_wallet_balance = 10.0 
+        
+        engine.run(df_feed, strat_cfg, funding_rate=0.0)
+        
+        # ต้องมีการบันทึกเหตุการณ์ Margin Call ลงใน List
+        assert len(engine.margin_call_events) > 0
+        
+        first_event = engine.margin_call_events[0]
+        assert 'margin_needed' in first_event
+        assert 'available_margin' in first_event
+        
+        # margin_needed ต้องมากกว่า available_margin แน่นอน ถึงโดน Reject
+        assert first_event['margin_needed'] > first_event['available_margin']

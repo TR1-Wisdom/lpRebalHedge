@@ -83,3 +83,12 @@ class TestPerpModule:
         assert close_fee == 1.0
         assert perp.total_trading_fees == 2.0 # 1.0 ตอนเปิด + 1.0 ตอนปิด
         assert len(perp.positions) == 0
+
+    def test_margin_call_rejection(self, perp: PerpModule) -> None:
+        """[Audit Fix] ทดสอบการ Reject คำสั่งเปิด Position เมื่อ Available Margin ไม่พอ"""
+        perp.update_market_price(2000.0)
+        
+        # ทุน CEX 1000 USD, Leverage 1x -> อยากเปิด 1 ETH (Notional = 2000 USD)
+        # Margin Required = 2000 + Fee (1.0) = 2001.0 USD -> เงิน 1000 ไม่พอแน่นอน ต้องโดน Reject
+        with pytest.raises(ValueError, match="MARGIN_CALL"):
+            perp.open_position(PositionSide.SHORT, size_in_token=1.0, cex_wallet_balance=1000.0)
