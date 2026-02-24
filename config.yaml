@@ -62,4 +62,4 @@ execution:
 # การโยกเงินข้ามพอร์ต (Cross-Margin Sweep) เพื่อรักษาสัดส่วนความเสี่ยง
 capital_management:
   enabled: true
-  freq_days: 30  # โยกเงินทุกๆ 30 วัน
+  freq_days: 15  # โยกเงินทุกๆ 15 วัน
