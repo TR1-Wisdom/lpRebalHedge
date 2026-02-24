@@ -1,6 +1,6 @@
 #--- Core Quant & Data Analysis ---
 
-pandas==2.2.0
+pandas>=2.2.0
 numpy>=1.24.0
 scipy>=1.11.0
 matplotlib>=3.8.0
@@ -10,15 +10,16 @@ plotly>=5.18.0
 
 streamlit>=1.31.0
 
-#--- Exchange & DeFi Integration ---
+#--- Blockchain & DeFi (Web3) ---
 
-ccxt>=4.2.0
 web3>=6.15.0
+eth-account>=0.11.0
+ccxt>=4.2.0
 
 #--- Configuration & Environment ---
 
-PyYAML>=6.0.1
 python-dotenv>=1.0.0
+PyYAML>=6.0.1
 requests>=2.31.0
 
 #--- Testing & Quality Assurance ---
