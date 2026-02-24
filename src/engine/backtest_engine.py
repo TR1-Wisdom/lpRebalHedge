@@ -102,11 +102,23 @@ class BacktestEngine:
                                     try:
                                         self._execute_perp_order(order, current_price, current_events)
                                     except ValueError:
+                                        available_margin, margin_needed = self._get_order_margin_snapshot(order, current_price)
                                         current_events.append("MARGIN_CALL_REJECT")
-                                        self.margin_call_events.append({'timestamp': current_time, 'price': current_price})
+                                        self.margin_call_events.append({
+                                            'timestamp': current_time,
+                                            'price': current_price,
+                                            'available_margin': available_margin,
+                                            'margin_needed': margin_needed
+                                        })
                                 else:
+                                    available_margin, margin_needed = self._get_order_margin_snapshot(order, current_price)
                                     current_events.append("MARGIN_CALL_REJECT")
-                                    self.margin_call_events.append({'timestamp': current_time, 'price': current_price})
+                                    self.margin_call_events.append({
+                                        'timestamp': current_time,
+                                        'price': current_price,
+                                        'available_margin': available_margin,
+                                        'margin_needed': margin_needed
+                                    })
 
                 last_execution_time = current_time 
                 
@@ -181,13 +193,8 @@ class BacktestEngine:
                 event_list.append("HEDGE_OFF")
 
     def _attempt_rescue(self, order, price) -> float:
-        current_short_size = self.perp.get_short_position_size()
-        target_diff = abs(order.target_size - current_short_size)
-        notional_needed = target_diff * price
-        trading_fee = notional_needed * self.perp.config.taker_fee
-        margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
-        available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
-        deficit = (margin_needed - available_margin) + 20.0 
+        available_margin, margin_needed = self._get_order_margin_snapshot(order, price)
+        deficit = (margin_needed - available_margin) + 20.0
         current_lp_profit = self.lp.position_value - self.lp_initial_capital
         if current_lp_profit > deficit and deficit > 0:
             self.lp.position_value -= deficit
@@ -195,6 +202,15 @@ class BacktestEngine:
             self.portfolio.record_transaction(TransactionType.DEPOSIT, deficit)
             return deficit
         return 0.0
+
+    def _get_order_margin_snapshot(self, order, price) -> tuple[float, float]:
+        current_short_size = self.perp.get_short_position_size()
+        target_diff = abs(order.target_size - current_short_size)
+        notional_needed = target_diff * price
+        trading_fee = notional_needed * self.perp.config.taker_fee
+        margin_needed = (notional_needed / self.perp.config.leverage) + trading_fee
+        available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - self.perp.get_total_margin_used()
+        return available_margin, margin_needed
 
     def _perform_capital_sweep(self, event_list):
         current_lp = self.lp.position_value

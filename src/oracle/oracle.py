@@ -60,22 +60,47 @@ class OracleModule:
             np.random.seed(config.seed)
             
         # กำหนดจำนวนแท่งต่อวันตาม Timeframe
+        timeframe = str(config.timeframe).strip().lower()
+        timeframe_aliases = {
+            '1min': '1m',
+            '5min': '5m',
+            '15min': '15m',
+            '60min': '1h',
+            '1hour': '1h',
+            '1day': '1d',
+            '1d': '1d',
+            '1h': '1h',
+            '4h': '4h',
+            '5m': '5m',
+            '15m': '15m',
+            '1m': '1m'
+        }
+        normalized_tf = timeframe_aliases.get(timeframe, timeframe)
+
         tf_map = {
             '1m': 24 * 60,
             '5m': 24 * 12,
             '15m': 24 * 4,
             '1h': 24,
+            '4h': 6,
             '1d': 1
         }
-        steps_per_day = tf_map.get(config.timeframe, 24 * 12) # Default 5m
-        freq_str = config.timeframe.replace('m', 'min').replace('h', 'h')
-        if freq_str == '1min': freq_str = 'min'
+        steps_per_day = tf_map.get(normalized_tf, 24 * 12) # Default 5m
+        freq_map = {
+            '1m': 'min',
+            '5m': '5min',
+            '15m': '15min',
+            '1h': 'h',
+            '4h': '4h',
+            '1d': 'D'
+        }
+        freq_str = freq_map.get(normalized_tf, '5min')
 
         total_steps = config.days * steps_per_day
         dt = 1.0 / (365.0 * steps_per_day)
         
-        mu = 0.05 # ค่าคาดหวังผลตอบแทน (Drift)
         sigma = config.annual_volatility
+        mu = 0.0 if sigma == 0 else 0.05  # ให้ราคาไม่ drift เมื่อผู้ใช้ต้องการกราฟนิ่ง
         
         # 1. คำนวณราคาปิด (Close Price) Vectorized
         shocks = np.random.normal(0, np.sqrt(dt), total_steps)
