@@ -105,6 +105,9 @@ class UniswapPositionManager:
                 "total_amount0": active_amt0 + owed_amt0,
                 "total_amount1": active_amt1 + owed_amt1,
                 "is_in_range": tick_lower <= current_tick <= tick_upper, # <-- ใช้ชื่อนี้เป็นมาตรฐาน
+                "current_tick": current_tick,
+                "tick_lower": tick_lower,
+                "tick_upper": tick_upper,
                 "latency_ms": round(latency_ms, 2)
             }
         except Exception as e:
