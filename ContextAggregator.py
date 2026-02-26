@@ -3,16 +3,31 @@ from datetime import datetime
 
 # --- Configuration ---
 # กำหนดชื่อโครงการที่นี่ เพื่อให้ชื่อไฟล์ output ไม่ซ้ำกันในแต่ละโปรเจกต์
-DEFAULT_PROJECT_NAME = "lpReablHedge" 
+DEFAULT_PROJECT_NAME = "lpRebalHedge" 
 
 PROJECT_ROOT = "."  # เริ่มต้นที่โฟลเดอร์ปัจจุบัน
 DEFAULT_DOCS_DIR = "docs"
 
 # ระบุนามสกุลไฟล์ที่ต้องการ (คุมเฉพาะประเภทไฟล์ตามที่ PD ต้องการ)
-EXTENSIONS = ['.py', '.md', '.sql']
+EXTENSIONS = ['.py', '.md', '.sql', '.yaml', '.yml', '.txt', '.toml', '.json']
 
 # โฟลเดอร์ที่ไม่ต้องการสแกน (เพื่อความสะอาดของข้อมูลและประสิทธิภาพ)
-EXCLUDE_DIRS = {'.git', '__pycache__', '.venv', 'node_modules', '.vscode', 'dist', 'build'}
+EXCLUDE_DIRS = {
+    '.git',
+    '__pycache__',
+    '.venv',
+    'node_modules',
+    '.vscode',
+    'dist',
+    'build',
+    '.pytest_cache',
+    '.mypy_cache',
+    '.ruff_cache',
+    '.cache',
+    'docs',
+    'results',
+    'logs',
+}
 
 # ไฟล์ที่ไม่ต้องการรวม
 EXCLUDE_FILES = {'aggregate_context.py', 'ContextAggregator.py'}
