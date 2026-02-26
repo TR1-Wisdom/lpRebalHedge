@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>LP + Delta Neutral Backtester (Single File)</title>
+
+    <!-- React (CDN) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Plotly (CDN) -->
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background:#0b0f14; color:#e8eef6;}
+      .wrap { max-width: 1200px; margin: 0 auto; padding: 18px; }
+      h1 { font-size: 18px; margin: 0 0 12px; }
+      .grid { display: grid; grid-template-columns: 420px 1fr; gap: 14px; }
+      .card { background:#121a24; border:1px solid #1f2a38; border-radius: 14px; padding: 14px; }
+      .row { display:flex; gap:10px; }
+      .row > div { flex:1; }
+      label { font-size: 12px; color:#a9b8cc; display:block; margin-bottom:6px; }
+      input, select, button, textarea {
+        width:100%; box-sizing:border-box; padding:10px; border-radius:10px;
+        border:1px solid #263244; background:#0e1520; color:#e8eef6;
+      }
+      button { cursor:pointer; border:1px solid #36527a; background:#12325a; }
+      button:disabled { opacity:0.6; cursor:not-allowed; }
+      .kpi { display:grid; grid-template-columns: repeat(4, 1fr); gap:10px; }
+      .kpi .box { background:#0e1520; border:1px solid #1f2a38; border-radius:12px; padding:10px; }
+      .kpi .name { font-size:12px; color:#a9b8cc; }
+      .kpi .val { font-size:16px; margin-top:6px; }
+      .small { font-size:12px; color:#a9b8cc; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+      table { width:100%; border-collapse: collapse; font-size:12px; }
+      th, td { border-bottom:1px solid #1f2a38; padding:8px; text-align:right; }
+      th { color:#a9b8cc; font-weight:600; }
+      td:first-child, th:first-child { text-align:left; }
+      .plots { display:grid; grid-template-columns: 1fr; gap: 12px; }
+      .plot { height: 280px; }
+      .pill { display:inline-block; padding:4px 8px; border-radius:999px; background:#0e1520; border:1px solid #1f2a38; font-size:12px; color:#a9b8cc;}
+      .warn { color:#ffd479; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>LP + Full Delta Neutral Hedge Backtester (Inventory Rebalance + EWMA Adaptive Hedge Threshold)</h1>
+      <div id="root"></div>
+      <div class="small" style="margin-top:10px;">
+        Notes: This is a research/backtest toy. It approximates Uniswap v3 position math using continuous price bounds (sqrtP)
+        and applies fee APR + funding carry. Use for concept validation, not financial advice.
+      </div>
+    </div>
+
+    <script type="text/babel">
+      const { useMemo, useState, useEffect, useRef } = React;
+
+      // -------------------------
+      // Helpers
+      // -------------------------
+      function clamp(x, lo, hi){ return Math.max(lo, Math.min(hi, x)); }
+      function fmt(x, d=2){
+        if (x === null || x === undefined || Number.isNaN(x)) return "-";
+        return Number(x).toLocaleString(undefined, {maximumFractionDigits:d});
+      }
+      function ln(x){ return Math.log(x); }
+
+      // -------------------------
+      // Uniswap v3-like math (continuous)
+      // price P = USDC per ETH
+      // sqrtP = sqrt(P)
+      //
+      // If in-range A<P<B:
+      //  amount0(ETH) = L*(sqrtB - sqrtP)/(sqrtP*sqrtB)
+      //  amount1(USDC)= L*(sqrtP - sqrtA)
+      //
+      // If P <= A => all token0: amount0 = L*(sqrtB - sqrtA)/(sqrtA*sqrtB), amount1=0
+      // If P >= B => all token1: amount1 = L*(sqrtB - sqrtA), amount0=0
+      // -------------------------
+      function amountsFromLiquidity(L, P, Pa, Pb){
+        const sqrtP = Math.sqrt(P);
+        const sqrtA = Math.sqrt(Pa);
+        const sqrtB = Math.sqrt(Pb);
+        if (sqrtA > sqrtB) return amountsFromLiquidity(L, P, Pb, Pa);
+
+        const amount0_all = L * (sqrtB - sqrtA) / (sqrtA * sqrtB);
+        const amount1_all = L * (sqrtB - sqrtA);
+
+        if (sqrtP <= sqrtA){
+          return { eth: amount0_all, usdc: 0, inRange:false };
+        }
+        if (sqrtP >= sqrtB){
+          return { eth: 0, usdc: amount1_all, inRange:false };
+        }
+
+        const eth = L * (sqrtB - sqrtP) / (sqrtP * sqrtB);
+        const usdc = L * (sqrtP - sqrtA);
+        return { eth, usdc, inRange:true };
+      }
+
+      // derive L from target amounts at current price within bounds (use conservative min)
+      function liquidityFromTargetAmounts(P, Pa, Pb, targetEth, targetUsdc){
+        const sqrtP = Math.sqrt(P);
+        const sqrtA = Math.sqrt(Pa);
+        const sqrtB = Math.sqrt(Pb);
+        if (!(sqrtA < sqrtP && sqrtP < sqrtB)){
+          // if not in range, just approximate via in-range formula using clipped P
+          const Pc = clamp(P, Pa*1.0000001, Pb*0.9999999);
+          return liquidityFromTargetAmounts(Pc, Pa, Pb, targetEth, targetUsdc);
+        }
+        const L0 = targetEth * (sqrtP * sqrtB) / (sqrtB - sqrtP);
+        const L1 = targetUsdc / (sqrtP - sqrtA);
+        return Math.min(L0, L1);
+      }
+
+      // -------------------------
+      // EWMA Volatility
+      // var_t = lambda*var_{t-1} + (1-lambda)*r^2
+      // r = ln(P_t/P_{t-1})
+      // vol = sqrt(var)
+      // -------------------------
+      function ewmaStep(prevVar, r, lambda){
+        return lambda*prevVar + (1-lambda)*(r*r);
+      }
+
+      // -------------------------
+      // Price path generator (GBM)
+      // dtHours: step size in hours
+      // volAnnual: annualized volatility (e.g., 0.7)
+      // muAnnual: drift (e.g., 0.0)
+      // -------------------------
+      function randn(){
+        // Box-Muller
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+      }
+      function genGBM({P0, steps, dtHours, volAnnual, muAnnual, seedMode=false}){
+        // seedMode: deterministic-ish via simple LCG if needed; keep off for now
+        const dt = dtHours / (365*24);
+        const vol = volAnnual;
+        const mu = muAnnual;
+        const out = [P0];
+        for (let i=1;i<=steps;i++){
+          const z = randn();
+          const dlog = (mu - 0.5*vol*vol)*dt + vol*Math.sqrt(dt)*z;
+          const P = out[i-1] * Math.exp(dlog);
+          out.push(P);
+        }
+        return out;
+      }
+
+      // -------------------------
+      // Backtest core
+      // -------------------------
+      function runBacktest(params){
+        const {
+          capitalUsd,
+          P0,
+          hours,
+          dtHours,
+          volAnnual,
+          muAnnual,
+
+          rangeWidthPct,        // e.g., 0.10 for +-10%
+          baseLpApr,            // e.g., 0.04
+          aprMultiplier,        // e.g., 20
+          feeAprOutOfRange,     // e.g., 0.0
+
+          // Inventory rebalance (LP)
+          rebalanceSkewThresh,  // e.g., 0.20 => rebalance when ethValueShare deviates from 0.5 by > 0.20
+          rebalanceGasUsd,      // on-chain gas cost per rebalance
+
+          // Hedge
+          hedgeCooldownHours,
+          hedgeStepMaxEth,
+          deltaFloorEthBase,
+          bandPctEquity,        // band% * equity / price -> eth
+          useAdaptive,
+          ewmaLambda,
+          volTarget,            // target vol of log-return per step (not annualized) OR compute from volAnnual baseline
+          mVolMin,
+          mVolMax,
+
+          // Funding
+          fundingPer8h,         // e.g. +0.0001 means +0.01% per 8h (receive when short)
+          takerFeeRate,         // e.g. 0.0004 (0.04%) each trade notional, simplistic
+
+        } = params;
+
+        const steps = Math.floor(hours / dtHours);
+        const prices = genGBM({P0, steps, dtHours, volAnnual, muAnnual});
+
+        // init LP bounds
+        let Pa = P0 * (1 - rangeWidthPct);
+        let Pb = P0 * (1 + rangeWidthPct);
+
+        // init LP target 50/50
+        let targetEth = (capitalUsd/2) / P0;
+        let targetUsdc = capitalUsd/2;
+
+        // compute liquidity L
+        let L = liquidityFromTargetAmounts(P0, Pa, Pb, targetEth, targetUsdc);
+
+        // hedge state
+        let perpEth = 0; // negative means short
+        let lastHedgeHour = -1e9;
+
+        // portfolio cash accounting
+        let cashUsd = 0; // keep it simple (fees/funding/gas accrue here)
+        let cumFunding = 0;
+        let cumTakerFees = 0;
+        let lpRebalanceCount = 0;
+        let hedgeTradeCount = 0;
+
+        // EWMA var
+        let varEwma = 0;
+        let prevP = prices[0];
+
+        const rows = [];
+
+        function lpValue(eth, usdc, P){
+          return eth*P + usdc;
+        }
+
+        for (let i=0;i<prices.length;i++){
+          const hour = i*dtHours;
+          const P = prices[i];
+
+          // update EWMA vol
+          let r = 0;
+          if (i > 0){
+            r = ln(P / prevP);
+            varEwma = ewmaStep(varEwma, r, ewmaLambda);
+            prevP = P;
+          }
+          const volStep = Math.sqrt(varEwma);
+
+          // read LP amounts
+          const lpAmt = amountsFromLiquidity(L, P, Pa, Pb);
+          let lpEth = lpAmt.eth;
+          let lpUsdc = lpAmt.usdc;
+          const inRange = lpAmt.inRange ? 1 : 0;
+
+          // LP fee accrual (simple APR model)
+          // if in-range: feeApr = baseLpApr * aprMultiplier else feeAprOutOfRange
+          const feeApr = (inRange ? baseLpApr * aprMultiplier : feeAprOutOfRange);
+          const feeRateStep = feeApr * (dtHours / (365*24));
+          const feeUsd = lpValue(lpEth, lpUsdc, P) * feeRateStep;
+          cashUsd += feeUsd;
+
+          // Funding accrual on perp (assume funding paid every step proportionally)
+          // Receive when short and fundingPer8h > 0
+          const fundingRateStep = fundingPer8h * (dtHours / 8.0);
+          const perpNotional = Math.abs(perpEth) * P;
+          const fundingUsd = (perpEth < 0 ? +perpNotional * fundingRateStep : -perpNotional * fundingRateStep);
+          cashUsd += fundingUsd;
+          cumFunding += fundingUsd;
+
+          // inventory skew for LP (eth value share)
+          const lpVal = lpValue(lpEth, lpUsdc, P);
+          const ethShare = lpVal > 0 ? (lpEth*P / lpVal) : 0;
+          const skewDev = Math.abs(ethShare - 0.5);
+
+          // Decide LP rebalance (slow/expensive)
+          // Rebalance when skew deviation exceeds threshold, OR out-of-range (optional)
+          const needRebalance = (skewDev > rebalanceSkewThresh) || (inRange === 0);
+
+          if (needRebalance){
+            // Close + reopen: set new bounds centered at current price
+            Pa = P * (1 - rangeWidthPct);
+            Pb = P * (1 + rangeWidthPct);
+
+            // Recompute target 50/50 using total value (LP + cash) for simplicity
+            // In production you might keep LP budget fixed and store excess as passive income; this is research-mode.
+            const totalEquity = lpVal + cashUsd + (perpEth*P); // perp MTM: position value
+            const newCapital = Math.max(0, totalEquity); // avoid negative
+
+            targetEth = (newCapital/2) / P;
+            targetUsdc = newCapital/2;
+
+            L = liquidityFromTargetAmounts(P, Pa, Pb, targetEth, targetUsdc);
+
+            cashUsd -= rebalanceGasUsd;
+            lpRebalanceCount += 1;
+          }
+
+          // After potential rebalance, refresh LP amounts for hedge decision (use current L and bounds)
+          const lpAmt2 = amountsFromLiquidity(L, P, Pa, Pb);
+          lpEth = lpAmt2.eth;
+          lpUsdc = lpAmt2.usdc;
+          const lpVal2 = lpValue(lpEth, lpUsdc, P);
+
+          // Hedge decision (fast/cheap)
+          const netDelta = lpEth + perpEth;
+
+          // Build threshold
+          const bandEth = (bandPctEquity * Math.max(0, (lpVal2 + cashUsd + perpEth*P))) / P;
+          let mVol = 1.0;
+          if (useAdaptive){
+            // if user doesn't set volTarget, derive baseline from annual vol into per-step log-return std
+            // approx: volStepTarget ≈ volAnnual * sqrt(dtYears)
+            const dtYears = dtHours / (365*24);
+            const impliedTarget = volAnnual * Math.sqrt(dtYears);
+            const target = (volTarget > 0) ? volTarget : impliedTarget;
+            mVol = clamp((volStep / (target || 1e-12)), mVolMin, mVolMax);
+          }
+          const floorEth = deltaFloorEthBase * mVol;
+          const threshEth = Math.max(floorEth, bandEth);
+
+          const cooldownOk = (hour - lastHedgeHour) >= hedgeCooldownHours;
+          let tradeEth = 0;
+
+          if (cooldownOk && Math.abs(netDelta) > threshEth){
+            tradeEth = -clamp(netDelta, -hedgeStepMaxEth, hedgeStepMaxEth);
+
+            // execute perp trade: update perpEth
+            // tradeEth positive => buy (reduce short / go long)
+            // tradeEth negative => sell (increase short)
+            perpEth += tradeEth;
+
+            // apply taker fee on notional
+            const fee = Math.abs(tradeEth) * P * takerFeeRate;
+            cashUsd -= fee;
+            cumTakerFees += fee;
+
+            lastHedgeHour = hour;
+            hedgeTradeCount += 1;
+          }
+
+          const netEquity = lpVal2 + cashUsd + (perpEth*P);
+          rows.push({
+            i, hour, P,
+            Pa, Pb,
+            lpEth, lpUsdc, lpVal: lpVal2,
+            inRange: (lpAmt2.inRange?1:0),
+            ethShare: ethShare,
+            skewDev,
+            perpEth,
+            netDelta,
+            threshEth,
+            mVol,
+            volStep,
+            feeUsd,
+            fundingUsd,
+            cashUsd,
+            netEquity,
+            tradeEth,
+            lpRebalanceCount,
+            hedgeTradeCount,
+          });
+        }
+
+        // summary stats
+        const equity0 = rows[0].netEquity;
+        const equityN = rows[rows.length-1].netEquity;
+        const ret = (equityN / equity0) - 1;
+
+        // max drawdown
+        let peak = -Infinity;
+        let mdd = 0;
+        for (const r of rows){
+          peak = Math.max(peak, r.netEquity);
+          const dd = peak > 0 ? (r.netEquity/peak - 1) : 0;
+          mdd = Math.min(mdd, dd);
+        }
+
+        // approx CAGR from hours
+        const years = (hours / (365*24));
+        const cagr = years > 0 ? (Math.pow(equityN/equity0, 1/years) - 1) : ret;
+
+        return {
+          rows,
+          summary: {
+            equity0,
+            equityN,
+            ret,
+            cagr,
+            mdd,
+            lpRebalanceCount,
+            hedgeTradeCount,
+            cumFunding,
+            cumTakerFees,
+          }
+        };
+      }
+
+      // -------------------------
+      // Plot component
+      // -------------------------
+      function Plot({id, data, layout}){
+        const ref = useRef(null);
+        useEffect(() => {
+          if (!ref.current) return;
+          Plotly.react(ref.current, data, {
+            paper_bgcolor: "#121a24",
+            plot_bgcolor: "#0e1520",
+            font: {color:"#e8eef6"},
+            margin: {l:50,r:20,t:30,b:40},
+            ...layout
+          }, {displayModeBar:false, responsive:true});
+        }, [data, layout]);
+        return <div className="plot" id={id} ref={ref}></div>;
+      }
+
+      // -------------------------
+      // App
+      // -------------------------
+      function App(){
+        const [p, setP] = useState({
+          capitalUsd: 1000,
+          P0: 2000,
+          hours: 24*30,
+          dtHours: 1,
+          volAnnual: 0.70,
+          muAnnual: 0.00,
+
+          rangeWidthPct: 0.10,
+          baseLpApr: 0.04,
+          aprMultiplier: 20,
+          feeAprOutOfRange: 0.00,
+
+          rebalanceSkewThresh: 0.20,
+          rebalanceGasUsd: 2.0,
+
+          hedgeCooldownHours: 2,
+          hedgeStepMaxEth: 0.03,
+          deltaFloorEthBase: 0.01,
+          bandPctEquity: 0.015,
+          useAdaptive: true,
+          ewmaLambda: 0.94,
+          volTarget: 0, // 0 => derived from volAnnual and dt
+          mVolMin: 1.0,
+          mVolMax: 3.0,
+
+          fundingPer8h: 0.0001,   // +0.01% per 8h receive when short
+          takerFeeRate: 0.0004,   // 0.04%
+        });
+
+        const [res, setRes] = useState(null);
+
+        const run = () => {
+          const params = {
+            ...p,
+            capitalUsd: Number(p.capitalUsd),
+            P0: Number(p.P0),
+            hours: Number(p.hours),
+            dtHours: Number(p.dtHours),
+            volAnnual: Number(p.volAnnual),
+            muAnnual: Number(p.muAnnual),
+            rangeWidthPct: Number(p.rangeWidthPct),
+            baseLpApr: Number(p.baseLpApr),
+            aprMultiplier: Number(p.aprMultiplier),
+            feeAprOutOfRange: Number(p.feeAprOutOfRange),
+            rebalanceSkewThresh: Number(p.rebalanceSkewThresh),
+            rebalanceGasUsd: Number(p.rebalanceGasUsd),
+            hedgeCooldownHours: Number(p.hedgeCooldownHours),
+            hedgeStepMaxEth: Number(p.hedgeStepMaxEth),
+            deltaFloorEthBase: Number(p.deltaFloorEthBase),
+            bandPctEquity: Number(p.bandPctEquity),
+            useAdaptive: Boolean(p.useAdaptive),
+            ewmaLambda: Number(p.ewmaLambda),
+            volTarget: Number(p.volTarget),
+            mVolMin: Number(p.mVolMin),
+            mVolMax: Number(p.mVolMax),
+            fundingPer8h: Number(p.fundingPer8h),
+            takerFeeRate: Number(p.takerFeeRate),
+          };
+          const out = runBacktest(params);
+          setRes(out);
+        };
+
+        useEffect(() => { run(); }, []); // initial run
+
+        const summary = res?.summary;
+        const rows = res?.rows || [];
+
+        const x = rows.map(r => r.hour);
+        const price = rows.map(r => r.P);
+        const equity = rows.map(r => r.netEquity);
+        const netDelta = rows.map(r => r.netDelta);
+        const thresh = rows.map(r => r.threshEth);
+        const mVol = rows.map(r => r.mVol);
+        const inRange = rows.map(r => r.inRange);
+
+        const last = rows.length ? rows[rows.length-1] : null;
+
+        return (
+          <div className="grid">
+            <div className="card">
+              <div className="row" style={{alignItems:"center", justifyContent:"space-between"}}>
+                <div><span className="pill">Concept: static core + adaptive EWMA volatility threshold</span></div>
+              </div>
+
+              <div style={{height:10}}/>
+
+              <div className="row">
+                <div>
+                  <label>Capital USD</label>
+                  <input value={p.capitalUsd} onChange={e=>setP({...p, capitalUsd:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Start Price (USDC/ETH)</label>
+                  <input value={p.P0} onChange={e=>setP({...p, P0:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Horizon (hours)</label>
+                  <input value={p.hours} onChange={e=>setP({...p, hours:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Step dt (hours)</label>
+                  <input value={p.dtHours} onChange={e=>setP({...p, dtHours:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Annual Vol</label>
+                  <input value={p.volAnnual} onChange={e=>setP({...p, volAnnual:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Annual Drift</label>
+                  <input value={p.muAnnual} onChange={e=>setP({...p, muAnnual:e.target.value})}/>
+                </div>
+              </div>
+
+              <hr style={{borderColor:"#1f2a38"}}/>
+
+              <div className="row">
+                <div>
+                  <label>LP Range Width (±%)</label>
+                  <input value={p.rangeWidthPct} onChange={e=>setP({...p, rangeWidthPct:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Inventory Rebalance Skew Thresh (|ethShare-0.5|)</label>
+                  <input value={p.rebalanceSkewThresh} onChange={e=>setP({...p, rebalanceSkewThresh:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Rebalance Gas USD</label>
+                  <input value={p.rebalanceGasUsd} onChange={e=>setP({...p, rebalanceGasUsd:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Fee APR base</label>
+                  <input value={p.baseLpApr} onChange={e=>setP({...p, baseLpApr:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>APR Multiplier (in-range)</label>
+                  <input value={p.aprMultiplier} onChange={e=>setP({...p, aprMultiplier:e.target.value})}/>
+                </div>
+                <div>
+                  <label>APR out-of-range</label>
+                  <input value={p.feeAprOutOfRange} onChange={e=>setP({...p, feeAprOutOfRange:e.target.value})}/>
+                </div>
+              </div>
+
+              <hr style={{borderColor:"#1f2a38"}}/>
+
+              <div className="row">
+                <div>
+                  <label>Adaptive Threshold (EWMA vol)</label>
+                  <select value={p.useAdaptive ? "1":"0"} onChange={e=>setP({...p, useAdaptive:e.target.value==="1"})}>
+                    <option value="1">ON</option>
+                    <option value="0">OFF (static only)</option>
+                  </select>
+                </div>
+                <div>
+                  <label>EWMA Lambda</label>
+                  <input value={p.ewmaLambda} onChange={e=>setP({...p, ewmaLambda:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Vol Target (per step, 0=auto)</label>
+                  <input value={p.volTarget} onChange={e=>setP({...p, volTarget:e.target.value})}/>
+                </div>
+                <div>
+                  <label>mVol clamp [min,max]</label>
+                  <div className="row">
+                    <div><input value={p.mVolMin} onChange={e=>setP({...p, mVolMin:e.target.value})}/></div>
+                    <div><input value={p.mVolMax} onChange={e=>setP({...p, mVolMax:e.target.value})}/></div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Delta Floor ETH (base)</label>
+                  <input value={p.deltaFloorEthBase} onChange={e=>setP({...p, deltaFloorEthBase:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Band % of equity (to ETH)</label>
+                  <input value={p.bandPctEquity} onChange={e=>setP({...p, bandPctEquity:e.target.value})}/>
+                </div>
+              </div>
+
+              <div className="row">
+                <div>
+                  <label>Hedge Cooldown (hours)</label>
+                  <input value={p.hedgeCooldownHours} onChange={e=>setP({...p, hedgeCooldownHours:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Hedge Step Max (ETH)</label>
+                  <input value={p.hedgeStepMaxEth} onChange={e=>setP({...p, hedgeStepMaxEth:e.target.value})}/>
+                </div>
+              </div>
+
+              <hr style={{borderColor:"#1f2a38"}}/>
+
+              <div className="row">
+                <div>
+                  <label>Funding per 8h (receive when short)</label>
+                  <input value={p.fundingPer8h} onChange={e=>setP({...p, fundingPer8h:e.target.value})}/>
+                </div>
+                <div>
+                  <label>Taker fee rate</label>
+                  <input value={p.takerFeeRate} onChange={e=>setP({...p, takerFeeRate:e.target.value})}/>
+                </div>
+              </div>
+
+              <div style={{height:10}}/>
+
+              <button onClick={run}>Run Backtest</button>
+
+              <div style={{height:12}}/>
+
+              {summary && (
+                <div className="kpi">
+                  <div className="box">
+                    <div className="name">End Equity</div>
+                    <div className="val">${fmt(summary.equityN, 2)}</div>
+                  </div>
+                  <div className="box">
+                    <div className="name">CAGR (approx)</div>
+                    <div className="val">{fmt(summary.cagr*100, 2)}%</div>
+                  </div>
+                  <div className="box">
+                    <div className="name">Max Drawdown</div>
+                    <div className="val">{fmt(summary.mdd*100, 2)}%</div>
+                  </div>
+                  <div className="box">
+                    <div className="name">Trades (Hedge / LP)</div>
+                    <div className="val">{summary.hedgeTradeCount} / {summary.lpRebalanceCount}</div>
+                  </div>
+                </div>
+              )}
+
+              {summary && (
+                <div style={{marginTop:10}} className="small">
+                  Funding (USD): <span className="mono">{fmt(summary.cumFunding,2)}</span><br/>
+                  Taker fees (USD): <span className="mono">{fmt(summary.cumTakerFees,2)}</span><br/>
+                  {last && (
+                    <>
+                      Latest net delta (ETH): <span className="mono">{fmt(last.netDelta, 4)}</span><br/>
+                      Latest threshold (ETH): <span className="mono">{fmt(last.threshEth, 4)}</span> &nbsp;
+                      <span className="pill">mVol={fmt(last.mVol,2)}</span>
+                      {p.useAdaptive && last.mVol >= p.mVolMax && <span className="warn"> &nbsp; (mVol at cap)</span>}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="card">
+              <div className="plots">
+                <Plot
+                  id="plot1"
+                  data={[
+                    {x, y: price, type:"scatter", mode:"lines", name:"Price"},
+                  ]}
+                  layout={{title:"Price Path"}}
+                />
+
+                <Plot
+                  id="plot2"
+                  data={[
+                    {x, y: equity, type:"scatter", mode:"lines", name:"Net Equity"},
+                  ]}
+                  layout={{title:"Net Equity (LP + cash + perp MTM)"}}
+                />
+
+                <Plot
+                  id="plot3"
+                  data={[
+                    {x, y: netDelta, type:"scatter", mode:"lines", name:"Net Delta (ETH)"},
+                    {x, y: thresh, type:"scatter", mode:"lines", name:"Threshold (ETH)"},
+                  ]}
+                  layout={{title:"Net Delta vs Adaptive Threshold"}}
+                />
+
+                <Plot
+                  id="plot4"
+                  data={[
+                    {x, y: mVol, type:"scatter", mode:"lines", name:"mVol"},
+                    {x, y: inRange, type:"scatter", mode:"lines", name:"InRange (0/1)"},
+                  ]}
+                  layout={{title:"Adaptive Multiplier (mVol) + InRange"}}
+                />
+
+                <div>
+                  <div className="small" style={{marginBottom:6}}>Recent rows (tail)</div>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>hr</th>
+                        <th>Price</th>
+                        <th>LP ETH</th>
+                        <th>Perp ETH</th>
+                        <th>Net Δ</th>
+                        <th>Thresh</th>
+                        <th>Trade</th>
+                        <th>Eq</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.slice(-12).map(r => (
+                        <tr key={r.i}>
+                          <td className="mono">{fmt(r.hour,0)}</td>
+                          <td className="mono">{fmt(r.P,2)}</td>
+                          <td className="mono">{fmt(r.lpEth,4)}</td>
+                          <td className="mono">{fmt(r.perpEth,4)}</td>
+                          <td className="mono">{fmt(r.netDelta,4)}</td>
+                          <td className="mono">{fmt(r.threshEth,4)}</td>
+                          <td className="mono">{fmt(r.tradeEth,4)}</td>
+                          <td className="mono">{fmt(r.netEquity,2)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<App />);
+    </script>
+  </body>
+</html>
