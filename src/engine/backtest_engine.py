@@ -1,288 +1,210 @@
 """
 src/engine/backtest_engine.py
-อัปเดต: v1.4.3 (Emergency Fix - Anti-Regression Edition)
-- แก้ไข Logic การคำนวณ Margin Snapshot ให้รวม Unrealized PnL (Fix ROI -1400% Bug)
-- เพิ่มระบบ Emergency Margin Rescue แบบจำกัดวงเงิน (ป้องกันการสูบเงินจาก LP จนพัง)
-- รักษาระบบ Event Logging, Inventory Tracking และ Cross-Margin Sweep ไว้ครบ 100%
+Engine v1.8.1: Universal Compatibility Fix
+อัปเกรด: 
+1. เพิ่มสวิตช์ record_all_ticks เพื่อให้ใช้ร่วมกับ UI (app.py) และ Optimizer ได้พร้อมกัน
+2. คืนค่า Column ทั้งหมดที่ Dashboard v1.5.1 ต้องการใช้วาดกราฟ Dual-Charts
 """
 
-__version__ = "1.4.3"
+__version__ = "1.8.1"
 
 import pandas as pd
-from typing import List, Dict, Any
-from datetime import datetime
+import numpy as np
+from typing import Dict, Any, List
 
-from src.oracle.oracle import OracleModule
-from src.lp.lp import LPModule
-from src.perp.perp import PerpModule, PositionSide
-from src.strategy.strategy import StrategyModule, StrategyConfig
-from src.portfolio.portfolio import PortfolioModule, TransactionType, PortfolioState
-
+from src.portfolio.portfolio import TransactionType
+from src.perp.perp import PositionSide
 
 class BacktestEngine:
-    def __init__(
-        self,
-        oracle: OracleModule,
-        lp: LPModule,
-        perp: PerpModule,
-        strategy: StrategyModule,
-        portfolio: PortfolioModule
-    ) -> None:
+    def __init__(self, oracle, lp, perp, strategy, portfolio):
         self.oracle = oracle
         self.lp = lp
         self.perp = perp
         self.strategy = strategy
         self.portfolio = portfolio
         
-        # Counters & Stats
-        self.hedge_count = 0 
-        self.margin_call_events: List[Dict[str, Any]] = [] 
-        self.withdrawal_count = 0
-        self.lp_initial_capital = lp.config.initial_capital
+        self.lp_rebalance_cooldown_timer = 0
+        self.skew_duration_counter = 0
+        self.hedge_grace_timer = 0
         
-        # Cross-Margin Stats
+        self.hedge_count = 0
         self.cross_rebalance_count = 0
+        self.withdrawal_count = 0
         self.total_swept_to_cex = 0.0
         self.total_swept_to_lp = 0.0
+        self.margin_call_events: List[Dict] = []
 
-    def get_margin_snapshot(self) -> Dict[str, float]:
-        """
-        [FIXED] คำนวณสถานะ Margin ที่แท้จริง (หัวใจสำคัญที่ Sr. Programmer ทำพลาด)
-        ต้องรวม Unrealized PnL เข้าไปในอำนาจการซื้อ (Buying Power) เสมอ
-        """
-        unrealized_pnl = self.perp.get_total_unrealized_pnl()
-        margin_used = self.perp.get_total_margin_used()
-        wallet_balance = self.portfolio.cex_wallet_balance
+    def run(self, data: pd.DataFrame, strat_cfg, funding_rate: float, 
+            harvest_config: dict = None, cross_rebalance_config: dict = None, 
+            execution_interval_min: int = 5, record_all_ticks: bool = True) -> pd.DataFrame:
         
-        # Available Margin = เงินสดในมือ + กำไร(หรือขาดทุน)ที่ยังไม่รับรู้ - เงินค้ำประกันที่โดนล็อก
-        available = wallet_balance + unrealized_pnl - margin_used
+        records = data.to_dict('records')
+        history = []
         
-        return {
-            "available": available,
-            "wallet": wallet_balance,
-            "pnl": unrealized_pnl,
-            "used": margin_used
-        }
+        if harvest_config is None: harvest_config = {}
+        if cross_rebalance_config is None: cross_rebalance_config = {}
+        
+        cross_rebal_enabled = cross_rebalance_config.get('enabled', False)
+        cross_rebal_freq = cross_rebalance_config.get('freq_days', 0)
+        cross_rebal_ticks = int((cross_rebal_freq * 24 * 60) / execution_interval_min) if cross_rebal_freq > 0 else 0
+        ticks_per_8h = int((8 * 60) / execution_interval_min) or 1
 
-    def run(self, data_feed: pd.DataFrame, strategy_config: StrategyConfig, 
-            funding_rate: float = 0.0001, 
-            harvest_config: Dict[str, Any] = None,
-            cross_rebalance_config: Dict[str, Any] = None,
-            execution_interval_min: int = 1) -> pd.DataFrame:
+        data = self.strategy.populate_indicators(data, strat_cfg)
+        data = self.strategy.populate_signals(data)
+        
+        signals = data['signal'].values
+        pct_changes = data['pct_change'].values
+        
+        lp_threshold = self.lp.config.rebalance_threshold
+        lp_cooldown_setting = 8 #(เช่น 8 ticks = 40 นาที)
+        lp_time_threshold = 4   #(ต้องเอียงกี่ tick ถึงจะขยับ)
+        
+        for i, row in enumerate(records):
+            current_price = float(row['close'])
+            timestamp = row['date']
+            signal = int(signals[i])
+            pct_change = float(pct_changes[i])
+            event_str = ""
             
-        # 0. เตรียมอินดิเคเตอร์และสัญญาณ
-        df = self.strategy.populate_indicators(data_feed, strategy_config)
-        df = self.strategy.populate_signals(df)
-
-        history: List[Dict[str, Any]] = []
-        last_execution_time: datetime = datetime(1970, 1, 1) 
-        last_funding_time: datetime = df['date'].iloc[0]
-        last_cap_rebal_date = df['date'].iloc[0]
-        last_withdrawal_date = df['date'].iloc[0]
-        
-        # Parsing Configs
-        withdraw_enabled = str(harvest_config.get('enabled', 'false')).lower() == 'true' if harvest_config else False
-        withdraw_freq = harvest_config.get('withdrawal_freq_days', 30) if harvest_config else 30
-        withdraw_target = harvest_config.get('target_amount', 0) if harvest_config else 0
-        
-        cap_rebal_enabled = str(cross_rebalance_config.get('enabled', 'true')).lower() == 'true' if cross_rebalance_config else False
-        cap_rebal_freq = cross_rebalance_config.get('freq_days', 30) if cross_rebalance_config else 30
-
-        for _, row in df.iterrows():
-            current_time: datetime = row['date']
-            current_price: float = row['close']
-            current_events: List[str] = []
-
-            # 1. Mark-to-Market (อัปเดตมูลค่าพอร์ตตามราคาปัจจุบัน)
             self.lp.update_price(current_price)
             self.perp.update_market_price(current_price)
-
-            # 2. เก็บ Fee (หัวใจของ ROI - เก็บทุก Tick)
-            lp_fee: float = self.lp.collect_fee()
-            if lp_fee > 0:
-                self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
-
-            # 3. Execution Block (ตรวจสอบความหน่วงเครือข่าย)
-            can_execute = (current_time - last_execution_time).total_seconds() >= (execution_interval_min * 60)
-
-            if can_execute:
-                # 3.1 Check On-chain Rebalance (LP)
-                rebalance_res = self.lp.check_and_rebalance()
-                if rebalance_res.is_rebalanced:
-                    self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebalance_res.gas_cost)
-                    self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebalance_res.slippage_cost)
-                    current_events.append("LP_REBALANCE")
-
-                # 3.2 Check Off-chain Hedge (Perp)
-                if not pd.isna(row['signal']):
-                    orders = self.strategy.generate_orders(row, strategy_config)
-                    for order in orders:
-                        try:
-                            self._execute_perp_order(order, current_price, current_events)
-                        except ValueError as e:
-                            if str(e) == "MARGIN_CALL":
-                                # พยายามกู้ชีพโดยดึงกำไรจาก LP
-                                deficit_filled = self._attempt_rescue(order, current_price)
-                                if deficit_filled > 0:
-                                    current_events.append(f"EMERGENCY_RESCUE(${deficit_filled:.0f})")
-                                    # ลองสั่งใหม่หลังเติมเงินแล้ว
-                                    try:
-                                        self._execute_perp_order(order, current_price, current_events)
-                                    except ValueError:
-                                        self._log_margin_failure(current_time, current_price, order, current_events)
-                                else:
-                                    self._log_margin_failure(current_time, current_price, order, current_events)
-
-                last_execution_time = current_time 
-                
-            # 4. Cross-Margin Sweep (รักษาสมดุลทุนระหว่าง LP และ CEX ทุกๆ X วัน)
-            if cap_rebal_enabled:
-                if (current_time - last_cap_rebal_date).total_seconds() >= (cap_rebal_freq * 86400):
-                    self._perform_capital_sweep(current_events)
-                    last_cap_rebal_date = current_time
-
-            # 5. Passive Income Withdrawal
-            if withdraw_enabled:
-                days_since_last = (current_time - last_withdrawal_date).days
-                if days_since_last >= withdraw_freq:
-                    current_lp_profit = self.lp.position_value - self.lp_initial_capital
-                    if current_lp_profit > 0:
-                        actual_withdraw = min(withdraw_target, current_lp_profit)
-                        self.lp.position_value -= actual_withdraw
-                        self.portfolio.record_transaction(TransactionType.WITHDRAWAL, -actual_withdraw)
-                        self.withdrawal_count += 1
-                        current_events.append(f"PASSIVE_WITHDRAWAL(${actual_withdraw:.0f})")
-                        last_withdrawal_date = current_time
-
-            # 6. Apply Funding Rate (ทุก 8 ชั่วโมง)
-            if (current_time - last_funding_time).total_seconds() >= 8 * 3600:
-                funding_pnl: float = self.perp.apply_funding(funding_rate)
+            
+            lp_fee = self.lp.collect_fee()
+            if lp_fee > 0: self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
+            
+            if i > 0 and i % ticks_per_8h == 0:
+                funding_pnl = self.perp.apply_funding(funding_rate)
                 if funding_pnl != 0:
-                    type_fund = TransactionType.REVENUE_FUNDING if funding_pnl > 0 else TransactionType.EXPENSE_FUNDING
-                    self.portfolio.record_transaction(type_fund, funding_pnl)
-                    current_events.append("FUNDING_PAYMENT")
-                last_funding_time = current_time
+                    cat = TransactionType.REVENUE_FUNDING if funding_pnl > 0 else TransactionType.EXPENSE_FUNDING
+                    self.portfolio.record_transaction(cat, funding_pnl)
 
-            # 7. บันทึกสถานะ State ลงใน History
-            snap = self.get_margin_snapshot()
-            state: PortfolioState = self.portfolio.get_state(
-                current_time, 
-                self.lp.position_value, 
-                snap["pnl"], 
-                snap["used"]
-            )
-            state_dict = vars(state)
-            state_dict['event'] = "|".join(current_events) if current_events else ""
-            state_dict['price'] = current_price
-            state_dict['perp_size'] = self.perp.get_short_position_size()
-            state_dict['lp_eth'] = self.lp.get_eth_inventory()
-            history.append(state_dict)
+            # PHASE A: LP 
+            if self.lp_rebalance_cooldown_timer > 0:
+                self.lp_rebalance_cooldown_timer -= 1
+            
+            is_skewed = abs(self.lp.skew - 0.5) > lp_threshold
+            is_out_of_range = (current_price <= self.lp.range_lower or current_price >= self.lp.range_upper)
+            
+            if is_skewed and self.lp_rebalance_cooldown_timer == 0:
+                self.skew_duration_counter += 1
+                if is_out_of_range or (self.skew_duration_counter >= lp_time_threshold):
+                    rebal_res = self.lp.check_and_rebalance()
+                    if rebal_res.is_rebalanced:
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebal_res.slippage_cost)
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebal_res.gas_cost)
+                        self.lp_rebalance_cooldown_timer = lp_cooldown_setting
+                        self.skew_duration_counter = 0
+                        self.hedge_grace_timer = 2 
+                        event_str += "LP_REBALANCE "
+            else:
+                self.skew_duration_counter = 0
+
+            # PHASE B: HEDGE
+            target_mode = getattr(strat_cfg, 'hedge_mode', 'smart')
+            effective_signal = -1 if target_mode == 'always' else signal
+            
+            if getattr(strat_cfg, 'use_safety_net', True) and abs(pct_change) >= strat_cfg.safety_net_pct:
+                if effective_signal == 1 and pct_change <= -strat_cfg.safety_net_pct:
+                    effective_signal = -1
+                    event_str += "SAFETY_NET "
+
+            actual_eth = self.lp.get_eth_inventory()
+            current_short = self.perp.get_short_position_size()
+            target_short = actual_eth if effective_signal == -1 else 0.0
+            
+            diff = abs(target_short - current_short)
+            needs_adjust = False
+            
+            if (target_short == 0 and current_short > 0) or (target_short > 0 and current_short == 0):
+                needs_adjust = True
+            elif target_short > 0 and (diff / target_short) > strat_cfg.hedge_threshold:
+                if diff > 0.0001: 
+                    needs_adjust = True
+                
+            if needs_adjust:
+                try:
+                    if self.hedge_grace_timer > 0:
+                        target_short = current_short + ((target_short - current_short) * 0.5)
+                    
+                    if target_short > current_short:
+                        fee = self.perp.open_position(PositionSide.SHORT, target_short - current_short, self.portfolio.cex_wallet_balance)
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                    else:
+                        pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, current_short - target_short)
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                        self.portfolio.record_transaction(TransactionType.DEPOSIT, pnl)
+                    
+                    self.hedge_count += 1
+                    event_str += "ADJUST_HEDGE "
+                except ValueError as e:
+                    if str(e) == "MARGIN_CALL":
+                        self._handle_margin_call(timestamp, current_price, target_short)
+                        event_str += "MARGIN_CALL_REJECT "
+            
+            if self.hedge_grace_timer > 0: self.hedge_grace_timer -= 1
+
+            # PHASE C: RESCUE & SWEEP
+            margin_used = self.perp.get_total_margin_used()
+            available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - margin_used
+            
+            if available_margin < 0:
+                rescue = min(abs(available_margin) * 1.5, self.lp.accumulated_fees * 0.8)
+                if rescue > 0:
+                    self.lp.accumulated_fees -= rescue
+                    self.portfolio.record_transaction(TransactionType.SWEEP_TO_CEX, rescue)
+                    event_str += "EMERGENCY_RESCUE "
+            
+            if cross_rebal_enabled and i > 0 and i % cross_rebal_ticks == 0:
+                self._execute_cross_margin_sweep()
+                event_str += "CROSS_SWEEP "
+
+            # PHASE D: RECORD (Universal Fix)
+            is_event = event_str != ""
+            is_last = i == len(records) - 1
+            
+            # [FIX] คืนค่า Columns ครบถ้วน เพื่อให้ app.py ใช้วาดกราฟได้
+            if record_all_ticks or is_event or is_last:
+                margin_used_final = self.perp.get_total_margin_used()
+                p_state = self.portfolio.get_state(timestamp, self.lp.position_value, self.perp.get_total_unrealized_pnl(), margin_used_final)
+                
+                history.append({
+                    'timestamp': p_state.timestamp,
+                    'price': current_price,
+                    'lp_eth': self.lp.get_eth_inventory(),
+                    'perp_size': self.perp.get_short_position_size(),
+                    'residual_delta': self.lp.get_eth_inventory() - self.perp.get_short_position_size(),
+                    'lp_value': p_state.lp_value,
+                    'perp_pnl': p_state.perp_pnl,
+                    'net_equity': p_state.net_equity,
+                    'cex_wallet_balance': p_state.cex_wallet_balance,
+                    'cex_available_margin': p_state.cex_available_margin,
+                    'total_fees_collected': p_state.total_fees_collected,
+                    'total_costs': p_state.total_costs,
+                    'total_withdrawn': p_state.total_withdrawn,
+                    'event': event_str.strip()
+                })
 
         return pd.DataFrame(history)
 
-    def _log_margin_failure(self, time, price, order, events):
-        """บันทึกข้อมูล Audit Log เมื่อไม่สามารถเปิด Hedge ได้เนื่องจาก Margin ไม่พอ"""
-        snap = self.get_margin_snapshot()
-        current_size = self.perp.get_short_position_size()
-        target_diff = abs(order.target_size - current_size)
-        notional_needed = target_diff * price
-        margin_needed = (notional_needed / self.perp.config.leverage) + (notional_needed * self.perp.config.taker_fee)
+    def _handle_margin_call(self, timestamp, price, target_size):
+        margin_used = self.perp.get_total_margin_used()
+        avail = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - margin_used
+        self.margin_call_events.append({'timestamp': timestamp, 'price': price, 'target_size': target_size, 'available_margin': avail})
         
-        self.margin_call_events.append({
-            'timestamp': time,
-            'price': price,
-            'available_margin': snap["available"],
-            'margin_needed': margin_needed
-        })
-        events.append("MARGIN_CALL_REJECT")
-
-    def _execute_perp_order(self, order, price, event_list):
-        """Helper สำหรับการจัดการธุรกรรมบน CEX"""
-        if order.action in ['HEDGE_ON', 'ADJUST_HEDGE']:
-            current_short = self.perp.get_short_position_size()
-            diff: float = order.target_size - current_short
-            
-            if diff > 0: 
-                fee = self.perp.open_position(PositionSide.SHORT, diff, self.portfolio.cex_wallet_balance)
-                self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                self.hedge_count += 1
-                event_list.append(f"HEDGE_INC({order.reason})")
-            elif diff < 0 and order.action == 'ADJUST_HEDGE':
-                size_to_close = abs(diff)
-                realized_pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, size_to_close)
-                self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
-                self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                self.hedge_count += 1
-                event_list.append(f"HEDGE_DEC({order.reason})")
-                
-        elif order.action == 'HEDGE_OFF':
-            if PositionSide.SHORT in self.perp.positions:
-                realized_pnl = self.perp.positions[PositionSide.SHORT].unrealized_pnl
-                fee = self.perp.close_position(PositionSide.SHORT)
-                self.portfolio.record_transaction(TransactionType.DEPOSIT, realized_pnl)
-                self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                self.hedge_count += 1
-                event_list.append("HEDGE_OFF")
-
-    def _attempt_rescue(self, order, price) -> float:
-        """
-        [FIXED] กู้ชีพเฉพาะเมื่อมีกำไรสะสมใน LP และป้องกันการถอนจนติดลบ
-        เพื่อป้องกัน Infinite Rescue Loop ที่ทำให้พอร์ตพัง
-        """
-        snap = self.get_margin_snapshot()
-        current_short_size = self.perp.get_short_position_size()
-        target_diff = abs(order.target_size - current_short_size)
-        
-        notional_needed = target_diff * price
-        margin_needed = (notional_needed / self.perp.config.leverage) + (notional_needed * self.perp.config.taker_fee)
-        
-        # คำนวณส่วนขาด (Deficit)
-        deficit = (margin_needed - snap["available"]) + 50.0 # เพิ่ม Safety Buffer
-        
-        # กฎเหล็ก: กู้ได้ไม่เกิน 80% ของกำไรสะสมฝั่ง LP เท่านั้น เพื่อไม่ให้กินทุนต้น
-        current_lp_profit = self.lp.position_value - self.lp_initial_capital
-        max_allowed_rescue = max(0, current_lp_profit * 0.8)
-        
-        actual_rescue = min(deficit, max_allowed_rescue)
-        
-        if actual_rescue > 10.0: # ทำเฉพาะยอดที่คุ้มค่าโอน
-            self.lp.position_value -= actual_rescue
-            self.portfolio.record_transaction(TransactionType.WITHDRAWAL, -actual_rescue)
-            self.portfolio.record_transaction(TransactionType.DEPOSIT, actual_rescue)
-            return actual_rescue
-            
-        return 0.0
-
-    def _perform_capital_sweep(self, event_list):
-        """รักษาสมดุลพอร์ตตามสัดส่วนทุนตั้งต้น (เช่น LP 10k : CEX 5k)"""
-        snap = self.get_margin_snapshot()
-        current_lp = self.lp.position_value
-        current_cex_equity = snap["wallet"] + snap["pnl"]
-        total_eq = current_lp + current_cex_equity
-        
-        initial_lp = self.lp_initial_capital
-        initial_cex = self.portfolio.initial_capital - initial_lp
-        initial_total = initial_lp + initial_cex
-        
-        target_lp = total_eq * (initial_lp / initial_total)
-        transfer_to_cex = current_lp - target_lp
-        
-        if transfer_to_cex > 10.0:
-            # LP กำไรเกินเป้า -> โอนไปช่วย CEX
-            self.lp.position_value -= transfer_to_cex
-            self.portfolio.cex_wallet_balance += transfer_to_cex
-            self.total_swept_to_cex += transfer_to_cex
+    def _execute_cross_margin_sweep(self):
+        lp_val, perp_cash = self.lp.position_value, self.portfolio.cex_wallet_balance
+        total = lp_val + perp_cash
+        if total <= 0: return
+        target_lp_val = total * (self.portfolio.lp_allocated_cash / self.portfolio.initial_capital)
+        diff = lp_val - target_lp_val
+        if abs(diff) > total * 0.05:
+            sweep = diff * 0.5
+            if sweep > 0: 
+                self.lp.position_value -= sweep
+                self.portfolio.record_transaction(TransactionType.SWEEP_TO_CEX, sweep)
+            else: 
+                sweep = abs(sweep)
+                if self.portfolio.cex_wallet_balance > sweep:
+                    self.portfolio.record_transaction(TransactionType.SWEEP_TO_LP, -sweep)
+                    self.lp.position_value += sweep
             self.cross_rebalance_count += 1
-            event_list.append(f"SWEEP_LP_TO_CEX(${transfer_to_cex:.0f})")
-        elif transfer_to_cex < -10.0:
-            # CEX กำไรเยอะ -> โอนกลับไปทบต้นที่ LP
-            amt_to_move = abs(transfer_to_cex)
-            # เช็คว่าเงินสดใน CEX พอให้โอนไหม (หัก margin ล็อกไว้)
-            actual_transfer = min(amt_to_move, snap["available"])
-            
-            if actual_transfer > 10.0:
-                self.portfolio.cex_wallet_balance -= actual_transfer
-                self.lp.position_value += actual_transfer
-                self.total_swept_to_lp += actual_transfer
-                self.cross_rebalance_count += 1
-                event_list.append(f"SWEEP_CEX_TO_LP(${actual_transfer:.0f})")

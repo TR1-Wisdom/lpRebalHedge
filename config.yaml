@@ -34,7 +34,7 @@ costs:
   gas_fee_usd: 2.0         
   slippage: 0.001          
   perp_taker_fee: 0.0005   
-  funding_rate_8h: 0.0001  
+  funding_rate_8h: 0.00007  
 
 # [6] Passive Income (NEW FEATURE)
 harvesting: 
@@ -46,13 +46,13 @@ harvesting:
 # รูปแบบ: [เปิด/ปิด (true/false), ค่าต่ำสุด, ค่าสูงสุด, สเต็ป]
 # หากตั้งเป็น false ระบบจะดึงค่าตั้งต้น (Base) จากหมวดด้านบนมาใช้โดยอัตโนมัติ
 optimization_space:
-  range_width: [true, 0.05, 0.10, 0.02]         # สแกนหาช่วง LP ที่เหมาะสม
-  rebalance_threshold: [true, 0.10, 0.30, 0.05] # สแกนหาจุด Rebalance
-  hedge_threshold: [true, 0.10, 0.25, 0.05]     # สแกนหาจุดปรับ Hedge
+  range_width: [false, 0.05, 0.10, 0.02]         # สแกนหาช่วง LP ที่เหมาะสม
+  rebalance_threshold: [false, 0.10, 0.30, 0.05] # สแกนหาจุด Rebalance
+  hedge_threshold: [false, 0.10, 0.25, 0.05]     # สแกนหาจุดปรับ Hedge
   safety_net_pct: [false, 0.02, 0.1, 0.02]     # (ปิด) ใช้ค่าตั้งต้น
   annual_volatility: [false, 0.40, 0.80, 0.20]   # (ใหม่) ทดสอบความผันผวน 40% ถึง 80%
-  seed: [true, 42, 72, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
-  freq_da: [true, 5, 30, 15]                   # (ใหม่) ทดสอบความถี่การโยกเงินข้ามพอร์ต 5, 15, 30 วัน
+  seed: [true, 42, 542, 1]                       # (ใหม่) ทดสอบสุ่มกราฟ 4 รูปแบบ (42, 43, 44, 45)
+  freq_da: [false, 5, 30, 15]                   # (ใหม่) ทดสอบความถี่การโยกเงินข้ามพอร์ต 5, 15, 30 วัน
 
 # [8] Execution Settings (NEW)
 execution:

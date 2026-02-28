@@ -24,6 +24,8 @@ class TransactionType(Enum):
     EXPENSE_FUNDING = "EXPENSE_FUNDING"
     DEPOSIT = "DEPOSIT"
     WITHDRAWAL = "WITHDRAWAL"
+    SWEEP_TO_CEX = "SWEEP_TO_CEX" # [NEW] โยกเงินภายในเข้า CEX
+    SWEEP_TO_LP = "SWEEP_TO_LP"   # [NEW] โยกเงินภายในเข้า LP
 
 
 @dataclass
@@ -54,7 +56,9 @@ class PortfolioModule:
             TransactionType.EXPENSE_SLIPPAGE: 0.0,
             TransactionType.EXPENSE_FUNDING: 0.0,
             TransactionType.DEPOSIT: 0.0,
-            TransactionType.WITHDRAWAL: 0.0
+            TransactionType.WITHDRAWAL: 0.0,
+            TransactionType.SWEEP_TO_CEX: 0.0,
+            TransactionType.SWEEP_TO_LP: 0.0
         }
 
     def allocate_to_lp(self, amount: float) -> float:
@@ -76,12 +80,14 @@ class PortfolioModule:
                 TransactionType.EXPENSE_PERP_FEE,
                 TransactionType.REVENUE_FUNDING,
                 TransactionType.EXPENSE_FUNDING,
-                TransactionType.DEPOSIT
+                TransactionType.DEPOSIT,
+                TransactionType.SWEEP_TO_CEX, # [NEW] บวกเงินเข้า CEX
+                TransactionType.SWEEP_TO_LP   # [NEW] หักเงินออกจาก CEX (ค่า amount เป็นลบ)
             ]
             if category in cex_transactions:
                 self.cex_wallet_balance += amount
             
-            # ถอนเงินนอกระบบ (Passive Income)
+            # ถอนเงินนอกระบบ (Passive Income) เท่านั้นถึงจะนับเป็น Withdrawn
             if category == TransactionType.WITHDRAWAL:
                 self.total_withdrawn_amount += abs(amount)
 
