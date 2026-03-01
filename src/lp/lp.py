@@ -1,166 +1,125 @@
 """
-โมดูล LP (Liquidity Pool) สำหรับโปรเจกต์ Inventory LP Backtester
-
-ทำหน้าที่จำลองการทำงานของ Concentrated Liquidity (เช่น Uniswap V3 / Steer Protocol)
-โดยคำนวณมูลค่าของพอร์ต (Impermanent Loss แบบ Macro-level), การเบ้ของสัดส่วนเหรียญ (Inventory Skew),
-การเก็บค่าธรรมเนียม, และการปรับสมดุลพอร์ตแบบอัตโนมัติ (Active Swap Rebalancing)
-
-ประวัติการแก้ไข (Version Control):
-- v1.0.1 (2026-02-20): เพิ่มระบบ fee_mode='base_apr' เพื่อให้สอดคล้องกับ UI Simulator
-- v1.0.0 (2026-02-20): สร้าง LP Module รองรับสมการ Concentrated Liquidity Multiplier และ Skew
+src/lp/lp.py
+โมดูล LP (v1.2.2 - Exact Math & Stat Fix)
+- คำนวณ IL แม่นยำ 100% ตาม Uniswap V3 Whitepaper
+- แก้ปัญหา Fee Explosion โดยส่งอัตรารายปีให้ Engine เป็นผู้จัดการ (Scaled per Tick)
+- รองรับระบบ Active Rebalance พร้อมการคิดต้นทุน Slippage และ Gas จริง
 """
-
-__version__ = "1.0.1"
-__author__ = "LP-Rebal-Coding (Senior Quant Developer)"
-__date__ = "2026-02-20"
 
 import math
 from dataclasses import dataclass
-
+from typing import Optional
 
 @dataclass
 class LPConfig:
-    """
-    Data Transfer Object (DTO) สำหรับเก็บพารามิเตอร์ของ Liquidity Pool
-
-    Attributes:
-        initial_capital (float): เงินทุนเริ่มต้นเป็นดอลลาร์ (USD)
-        range_width (float): ความกว้างของช่วงราคาจากจุดกึ่งกลาง (เช่น 0.10 คือ ±10%)
-        fee_tier (float): อัตราค่าธรรมเนียมของ Pool (เช่น 0.0005 คือ 0.05%)
-        daily_volume (float): ปริมาณการซื้อขายเฉลี่ยรายวันของ Pool
-        pool_tvl (float): มูลค่าสภาพคล่องรวม (TVL) ของ Pool ปัจจุบัน
-        rebalance_threshold (float): เกณฑ์ความเบี่ยงเบนของ Skew ที่ยอมรับได้ก่อนทำการ Rebalance (เช่น 0.15)
-        gas_fee (float): ค่าใช้จ่ายคงที่ (USD) ในการรันธุรกรรม Rebalance บน On-chain
-        slippage (float): อัตรา Slippage ที่สูญเสียตอนทำ Active Swap (เช่น 0.001 คือ 0.1%)
-        fee_mode (str): โหมดการคำนวณรายได้ ('volume' หรือ 'base_apr')
-        base_apr (float): อัตราผลตอบแทนพื้นฐานรายปี (เช่น 0.05 คือ 5% ต่อปี)
-    """
-    initial_capital: float = 10000.0
-    range_width: float = 0.10
-    fee_tier: float = 0.0005
-    daily_volume: float = 3560000.0
-    pool_tvl: float = 112480000.0
-    rebalance_threshold: float = 0.15
-    gas_fee: float = 2.0
-    slippage: float = 0.001
-    fee_mode: str = 'volume'
-    base_apr: float = 0.05
-
+    """การตั้งค่าพารามิเตอร์ของโมดูล LP"""
+    initial_capital: float
+    range_width: float         # เช่น 0.10 สำหรับ ±10%
+    rebalance_threshold: float    # เช่น 0.20 สำหรับจุดขยับพอร์ตเมื่อ Skew เอียงเกิน 70:30
+    base_apr: float = 0.05       # APR พื้นฐานของ Pool V2 (ก่อนคูณ Multiplier)
+    gas_fee: float = 2.0         # ค่าแก๊สต่อการ Rebalance ($)
+    slippage: float = 0.001      # Slippage จากการ Swap ส่วนเกิน (0.1%)
 
 @dataclass
 class RebalanceResult:
-    """DTO แจ้งผลลัพธ์การ Rebalance"""
+    """ข้อมูลสรุปผลหลังจากการ Rebalance"""
     is_rebalanced: bool
-    swap_volume_usd: float
-    slippage_cost: float
-    gas_cost: float
-
+    gas_cost: float = 0.0
+    slippage_cost: float = 0.0
 
 class LPModule:
-    """จำลองสถานะของ Liquidity Pool บน Concentrated Liquidity"""
-
-    def __init__(self, config: LPConfig, start_price: float) -> None:
+    def __init__(self, config: LPConfig, start_price: float):
         self.config = config
-        self.current_price: float = start_price
-        self.position_value: float = config.initial_capital
+        self.position_value = config.initial_capital
+        self.current_price = start_price
         
-        self.range_lower: float = start_price * (1.0 - config.range_width)
-        self.range_upper: float = start_price * (1.0 + config.range_width)
+        # ตั้งค่าช่วงราคา (Range) แบบ V3
+        self.range_lower = start_price * (1 - config.range_width)
+        self.range_upper = start_price * (1 + config.range_width)
         
-        self.multiplier: float = self._calculate_multiplier(config.range_width)
+        # หัวใจสำคัญ: คำนวณ Multiplier และ Liquidity Amount (L)
+        self.multiplier = self._calculate_multiplier()
+        self.L = self._calculate_initial_L(self.position_value, start_price)
         
-        self.skew: float = 0.5 
-        
-        self.accumulated_fees: float = 0.0
-        self.rebalance_count: int = 0
+        self.skew = 0.5           # สัดส่วนมูลค่า ETH เทียบกับ Total
+        self.rebalance_count = 0
+        self.accumulated_fees = 0.0 # ใช้สำรองเฉพาะเป็น Buffer สำหรับระบบ Rescue
 
-    def _calculate_multiplier(self, range_width: float) -> float:
-        """คำนวณค่า Multiplier ที่สะท้อนความเข้มข้นของ Liquidity"""
-        lower: float = 1.0 - range_width
-        upper: float = 1.0 + range_width
-        
-        if lower <= 0.0 or upper <= 0.0:
-            return 0.0
-            
-        numerator: float = 2.0
-        denominator: float = 2.0 - (1.0 / math.sqrt(upper)) - math.sqrt(lower)
-        
-        if denominator <= 0.0:
-            return 1.0
-            
-        return numerator / denominator
+    def _calculate_multiplier(self) -> float:
+        """คำนวณประสิทธิภาพเงินทุนจาก Range Width ตามหลัก V3 Whitepaper"""
+        sa = math.sqrt(max(0.0001, 1 - self.config.range_width))
+        sb = math.sqrt(1 + self.config.range_width)
+        # Multiplier = 2 / (2 - (1/sqrt(Pb)) - sqrt(Pa)) โดยประมาณที่จุดกึ่งกลาง
+        return 2 / (2 - (1 / sb) - sa)
 
-    def update_price(self, new_price: float) -> None:
-        """อัปเดตราคาตลาด พร้อมคำนวณมูลค่าพอร์ตแบบ Mark-to-Market และปรับ Skew"""
-        if self.current_price <= 0:
-            self.current_price = new_price
-            return
+    def _calculate_initial_L(self, capital: float, price: float) -> float:
+        """หาค่าสภาพคล่อง (L) จากเงินต้นและช่วงราคา (Square Root Invariant)"""
+        sp = math.sqrt(price)
+        sa = math.sqrt(self.range_lower)
+        sb = math.sqrt(self.range_upper)
+        # L = Capital / ((sqrt(P) - sqrt(Pa)) + P * (sqrt(Pb) - sqrt(P)) / (sqrt(P) * sqrt(Pb)))
+        return capital / ((sp - sa) + (price * (sb - sp) / (sp * sb)))
 
-        price_change_pct: float = (new_price - self.current_price) / self.current_price
-
-        base_asset_val: float = self.position_value * self.skew
-        quote_asset_val: float = self.position_value * (1.0 - self.skew)
-
-        new_base_asset_val: float = base_asset_val * (1.0 + price_change_pct)
-        self.position_value = new_base_asset_val + quote_asset_val
-
+    def update_price(self, new_price: float):
+        """[CORE UPDATE] อัปเดตมูลค่าพอร์ต MTM โดยใช้ Exact Square Root Math"""
+        if new_price <= 0: return
         self.current_price = new_price
+        
+        sp = math.sqrt(new_price)
+        sa = math.sqrt(self.range_lower)
+        sb = math.sqrt(self.range_upper)
 
-        if self.current_price <= self.range_lower:
+        if new_price <= self.range_lower:
+            # หลุดล่าง: ถือ ETH เต็มพอร์ต (100% Skew)
+            self.position_value = self.L * (sb - sa) / (sa * sb) * new_price
             self.skew = 1.0
-        elif self.current_price >= self.range_upper:
+        elif new_price >= self.range_upper:
+            # หลุดบน: ถือ USDC เต็มพอร์ต (0% Skew)
+            self.position_value = self.L * (sb - sa)
             self.skew = 0.0
         else:
-            range_size: float = self.range_upper - self.range_lower
-            self.skew = 1.0 - ((self.current_price - self.range_lower) / range_size)
+            # อยู่ในกรอบ: คำนวณมูลค่า ETH และ USDC แยกส่วนกัน
+            eth_amount = self.L * (sb - sp) / (sp * sb)
+            usdc_amount = self.L * (sp - sa)
+            
+            self.position_value = (eth_amount * new_price) + usdc_amount
+            # คำนวณ Skew ที่แม่นยำ (สัดส่วน ETH ในพอร์ต)
+            self.skew = (eth_amount * new_price) / self.position_value
 
-    def collect_fee(self) -> float:
-        """คำนวณและเก็บสะสมรายได้จากค่าธรรมเนียม (Trading Fee) ประจำ Tick (5 นาที)"""
+    def get_annual_fee_rate(self) -> float:
+        """[STAT FIX] คืนค่าอัตรากำไรรายปี เพื่อให้ Engine นำไปหารเป็นรายนาที"""
         if self.range_lower < self.current_price < self.range_upper:
-            # ปรับฐานการคำนวณจากรายชั่วโมงเป็นราย Tick (1 แท่ง = 5 นาที)
-            ticks_per_year = (365.0 * 24.0 * 12.0) # 12 แท่งต่อชั่วโมง
-            
-            if self.config.fee_mode == 'base_apr':
-                effective_apr = self.config.base_apr * self.multiplier
-                tick_fee = self.position_value * (effective_apr / ticks_per_year)
-            else:
-                # โหมด Volume เดิม (ปรับให้เป็น 5 นาที)
-                base_share = self.position_value / self.config.pool_tvl
-                volume_share = self.config.daily_volume / (24.0 * 12.0)
-                tick_fee = base_share * volume_share * self.config.fee_tier * self.multiplier
-            
-            self.position_value += tick_fee
-            self.accumulated_fees += tick_fee
-            return tick_fee
-            
+            # กำไรรายปี = มูลค่าพอร์ตปัจจุบัน * (APR * Multiplier)
+            return self.position_value * (self.config.base_apr * self.multiplier)
         return 0.0
 
     def check_and_rebalance(self) -> RebalanceResult:
-        """ตรวจสอบว่า Skew เบี่ยงเบนเกิน Threshold หรือไม่ เพื่อ Rebalance"""
-        drift: float = abs(self.skew - 0.5)
+        """ตรวจสอบและ Re-center พอร์ตเมื่อ Skew เอียงเกินเกณฑ์"""
+        drift = abs(self.skew - 0.5)
         
         if drift > self.config.rebalance_threshold:
-            swap_volume: float = self.position_value * drift
+            # 1. คำนวณต้นทุน Slippage จากปริมาณที่ต้อง Swap จริง (Active Swap)
+            swap_volume = self.position_value * drift
+            slippage_cost = swap_volume * self.config.slippage
+            gas_cost = self.config.gas_fee
             
-            slippage_cost: float = swap_volume * self.config.slippage
-            gas_cost: float = self.config.gas_fee
-            total_cost: float = slippage_cost + gas_cost
+            # 2. หักต้นทุนออกจากมูลค่าพอร์ต
+            self.position_value -= (slippage_cost + gas_cost)
             
-            self.position_value -= total_cost
+            # 3. วาง Range ใหม่ที่ราคาปัจจุบัน
+            self.range_lower = self.current_price * (1 - self.config.range_width)
+            self.range_upper = self.current_price * (1 + self.config.range_width)
             
-            self.range_lower = self.current_price * (1.0 - self.config.range_width)
-            self.range_upper = self.current_price * (1.0 + self.config.range_width)
+            # 4. คำนวณค่า L ใหม่สำหรับตำแหน่งใหม่ (Re-centering)
+            self.L = self._calculate_initial_L(self.position_value, self.current_price)
             self.skew = 0.5
-            
             self.rebalance_count += 1
             
-            return RebalanceResult(True, swap_volume, slippage_cost, gas_cost)
+            return RebalanceResult(True, gas_cost, slippage_cost)
             
-        return RebalanceResult(False, 0.0, 0.0, 0.0)
+        return RebalanceResult(False)
 
     def get_eth_inventory(self) -> float:
-        if self.current_price <= 0:
-            return 0.0
-        base_value_usd: float = self.position_value * self.skew
-        amount_tokens: float = base_value_usd / self.current_price
-        return amount_tokens
+        """ส่งจำนวนเหรียญ ETH ที่ถืออยู่จริง (หน่วย Token) เพื่อใช้คำนวณ Delta Hedge"""
+        if self.current_price <= 0: return 0.0
+        return (self.position_value * self.skew) / self.current_price

@@ -1,137 +1,159 @@
 """
 src/perp/perp.py
-โมดูล Perp (Perpetual Futures)
+โมดูลจัดการสถานะ Perpetual Futures (v1.1.0 - Realized PnL Edition)
 
-อัปเดต: v1.0.4 (Audit Fix) เพิ่ม get_total_margin_used()
+อัปเดต:
+- ระบบคำนวณราคาเข้าเฉลี่ย (Weighted Entry Price - VWAP)
+- ระบบคืนค่า Realized PnL เมื่อมีการปิดหรือลดขนาดสถานะ (เพื่อป้องกัน PnL Leakage)
+- ระบบคำนวณ Margin Used สำหรับเช็คความเสี่ยงพอร์ตแตก (Margin Call)
 """
 
-__version__ = "1.0.4"
-
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict
-
+from typing import Dict, Optional, Tuple
 
 class PositionSide(Enum):
+    """ทิศทางของสถานะการเทรด"""
     LONG = "LONG"
     SHORT = "SHORT"
 
-
 @dataclass
 class Position:
+    """ข้อมูลรายละเอียดของสถานะที่เปิดอยู่"""
     side: PositionSide
-    size: float
-    entry_price: float
+    size: float         # ขนาดสถานะในหน่วย Token (เช่น ETH)
+    entry_price: float  # ราคาเข้าเฉลี่ย (VWAP)
     unrealized_pnl: float = 0.0
-    margin_used: float = 0.0
-
 
 @dataclass
 class PerpConfig:
-    leverage: float = 1.0
-    maker_fee: float = 0.0002
-    taker_fee: float = 0.0005
-
+    """การตั้งค่าพารามิเตอร์ของโมดูล Perp"""
+    leverage: float = 5.0
+    taker_fee: float = 0.0005  # ค่าธรรมเนียม Taker (0.05%)
 
 class PerpModule:
-    def __init__(self, config: PerpConfig) -> None:
+    def __init__(self, config: PerpConfig):
         self.config = config
         self.positions: Dict[PositionSide, Position] = {}
         self.current_market_price: float = 0.0
         self.total_trading_fees: float = 0.0
         self.total_funding_pnl: float = 0.0
+        self.logger = logging.getLogger("PerpModule")
 
-    def update_market_price(self, new_price: float) -> None:
-        self.current_market_price = new_price
+    def update_market_price(self, price: float):
+        """อัปเดตราคาตลาดปัจจุบันและคำนวณกำไร/ขาดทุนที่ยังไม่รับรู้ (MTM)"""
+        self.current_market_price = price
         for side, pos in self.positions.items():
             if side == PositionSide.LONG:
-                pos.unrealized_pnl = pos.size * (new_price - pos.entry_price)
+                pos.unrealized_pnl = pos.size * (price - pos.entry_price)
             else:
-                pos.unrealized_pnl = pos.size * (pos.entry_price - new_price)
-
-    def get_total_margin_used(self) -> float:
-        """[Audit Fix] ดึง Margin ที่โดนล็อกไว้ทั้งหมดเพื่อส่งให้ Portfolio"""
-        return sum(pos.margin_used for pos in self.positions.values())
+                pos.unrealized_pnl = pos.size * (pos.entry_price - price)
 
     def open_position(self, side: PositionSide, size_in_token: float, cex_wallet_balance: float) -> float:
-        notional_value: float = size_in_token * self.current_market_price
-        trading_fee: float = notional_value * self.config.taker_fee
-        added_margin: float = notional_value / self.config.leverage
-
-        total_unrealized_pnl = self.get_total_unrealized_pnl()
-        total_margin_used = self.get_total_margin_used()
-        available_margin = cex_wallet_balance + total_unrealized_pnl - total_margin_used
-
-        if available_margin < (added_margin + trading_fee):
+        """
+        เปิดสถานะใหม่หรือเพิ่มขนาดสถานะ (Average Entry)
+        คืนค่า: ค่าธรรมเนียมการเทรด (Trading Fee) ที่เกิดขึ้น
+        """
+        if size_in_token <= 0: return 0.0
+        
+        notional_value = size_in_token * self.current_market_price
+        trade_fee = notional_value * self.config.taker_fee
+        
+        # ตรวจสอบเบื้องต้นเรื่อง Margin (ความปลอดภัยชั้นแรก)
+        required_margin = notional_value / self.config.leverage
+        if (cex_wallet_balance - trade_fee) < required_margin:
+            # หมายเหตุ: ในระบบจำลอง Engine จะเป็นคนดักจับ Exception นี้เพื่อบันทึกเหตุการณ์ Margin Call
             raise ValueError("MARGIN_CALL")
 
         if side in self.positions:
+            # กรณีมีสถานะเดิมอยู่แล้ว ให้คำนวณราคาเฉลี่ยใหม่ (VWAP)
             pos = self.positions[side]
-            total_size = pos.size + size_in_token
-            new_entry = ((pos.size * pos.entry_price) + (size_in_token * self.current_market_price)) / total_size
+            old_total_cost = pos.size * pos.entry_price
+            new_add_cost = size_in_token * self.current_market_price
             
-            pos.size = total_size
-            pos.entry_price = new_entry
-            pos.margin_used += added_margin
+            new_total_size = pos.size + size_in_token
+            new_entry_price = (old_total_cost + new_add_cost) / new_total_size
+            
+            pos.size = new_total_size
+            pos.entry_price = new_entry_price
         else:
+            # เปิดสถานะใหม่
             self.positions[side] = Position(
-                side=side,
-                size=size_in_token,
-                entry_price=self.current_market_price,
-                margin_used=added_margin
+                side=side, 
+                size=size_in_token, 
+                entry_price=self.current_market_price
             )
-        
-        self.total_trading_fees += trading_fee
-        self.update_market_price(self.current_market_price)
-        return trading_fee
 
-    def close_partial_position(self, side: PositionSide, size_to_close: float) -> tuple[float, float]:
+        self.total_trading_fees += trade_fee
+        self.update_market_price(self.current_market_price)
+        return trade_fee
+
+    def close_partial_position(self, side: PositionSide, size_to_close: float) -> Tuple[float, float]:
+        """
+        [CORE FUNCTION] ลดขนาดหรือปิดสถานะบางส่วน
+        คืนค่า: (Realized PnL, Trade Fee)
+        """
         if side not in self.positions:
             return 0.0, 0.0
             
         pos = self.positions[side]
-        if size_to_close >= pos.size:
-            realized_pnl = pos.unrealized_pnl
-            fee = self.close_position(side)
-            return realized_pnl, fee
+        actual_close_size = min(size_to_close, pos.size)
+        
+        # 1. คำนวณ Realized PnL จากส่วนที่ปิดจริง (เทียบกับ Entry Price ของตำแหน่งนั้น)
+        if side == PositionSide.LONG:
+            realized_pnl = actual_close_size * (self.current_market_price - pos.entry_price)
+        else:
+            realized_pnl = actual_close_size * (pos.entry_price - self.current_market_price)
             
-        ratio = size_to_close / pos.size
-        realized_pnl = pos.unrealized_pnl * ratio
+        # 2. คำนวณค่าธรรมเนียม Taker Fee สำหรับออเดอร์ปิด
+        trade_fee = (actual_close_size * self.current_market_price) * self.config.taker_fee
         
-        notional_closed = size_to_close * self.current_market_price
-        fee = notional_closed * self.config.taker_fee
+        # 3. อัปเดตข้อมูลสถานะ
+        self.total_trading_fees += trade_fee
+        pos.size -= actual_close_size
         
-        pos.size -= size_to_close
-        pos.margin_used -= (pos.margin_used * ratio)
-        
-        self.total_trading_fees += fee
-        self.update_market_price(self.current_market_price) 
-        
-        return realized_pnl, fee
-
-    def close_position(self, side: PositionSide) -> float:
-        if side not in self.positions:
-            return 0.0
+        # ถ้าปิดจนหมด ให้ลบสถานะออกจากรายการ
+        if pos.size <= 1e-9: # กันค่าจุกจิกจาก Floating Point
+            del self.positions[side]
+        else:
+            self.update_market_price(self.current_market_price)
             
-        pos = self.positions[side]
-        trading_fee: float = (pos.size * self.current_market_price) * self.config.taker_fee
-        
-        del self.positions[side]
-        self.total_trading_fees += trading_fee
-        return trading_fee
+        return realized_pnl, trade_fee
 
-    def apply_funding(self, funding_rate_pct: float) -> float:
-        net_funding_pnl: float = 0.0
+    def apply_funding(self, rate: float) -> float:
+        """
+        คิดค่าธรรมเนียมการถือครองสถานะ (Funding Rate)
+        คืนค่า: จำนวนเงิน Funding ที่ได้รับ (+) หรือต้องจ่าย (-)
+        """
+        net_funding = 0.0
         for side, pos in self.positions.items():
-            notional: float = pos.size * self.current_market_price
-            payment: float = notional * funding_rate_pct
-            net_funding_pnl += payment if side == PositionSide.SHORT else -payment
+            notional = pos.size * self.current_market_price
+            payment = notional * rate
+            
+            # ใน Binance Futures: 
+            # ถ้า Rate เป็นบวก (+) -> ฝั่ง Long จ่ายให้ฝั่ง Short
+            if side == PositionSide.SHORT:
+                net_funding += payment
+            else:
+                net_funding -= payment
                 
-        self.total_funding_pnl += net_funding_pnl
-        return net_funding_pnl
+        self.total_funding_pnl += net_funding
+        return net_funding
 
     def get_short_position_size(self) -> float:
-        return self.positions[PositionSide.SHORT].size if PositionSide.SHORT in self.positions else 0.0
+        """คืนค่าขนาดของสถานะ Short ปัจจุบัน (สำหรับใช้ในระบบ Hedge)"""
+        pos = self.positions.get(PositionSide.SHORT)
+        return pos.size if pos else 0.0
 
     def get_total_unrealized_pnl(self) -> float:
+        """รวมกำไร/ขาดทุนที่ยังไม่รับรู้ของทุกสถานะที่เปิดอยู่"""
         return sum(pos.unrealized_pnl for pos in self.positions.values())
+
+    def get_total_margin_used(self) -> float:
+        """คำนวณจำนวนเงินประกัน (Margin) ที่ถูกล็อกไว้ทั้งหมด"""
+        total_margin = 0.0
+        for pos in self.positions.values():
+            # Initial Margin = Notional Value / Leverage
+            total_margin += (pos.size * self.current_market_price) / self.config.leverage
+        return total_margin

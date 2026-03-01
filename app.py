@@ -1,221 +1,214 @@
 """
-app.py (Streamlit UI for Quant Lab v1.5.2)
-- อัปเกรด: Config Sync Edition (ดึงค่าตั้งต้นจาก config.yaml เสมอ)
-- แก้ไข: นำค่า Hardcoded (Funding Rate, Safety Net) ออกมาให้ปรับผ่าน UI ได้
-- รับประกันผลลัพธ์ตรงกับ Optimizer 100% เมื่อใช้พารามิเตอร์ชุดเดียวกัน
+app.py (Quant Lab Dashboard v1.5.6 Master)
+- ระบบจำลองกลยุทธ์ Inventory-based LP & Smart Hedge
+- ซิงค์พารามิเตอร์อัตโนมัติจาก config.yaml
+- วิเคราะห์ Residual Risk และ PnL Decomposition รายละเอียดสูง
+- รองรับระบบบัญชีแบบ Realized PnL และ Fee Scaling Fix
 """
 
 import os
 import yaml
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 
+# นำเข้า Core Modules จากโครงสร้างโปรเจกต์
 from src.oracle.oracle import OracleModule, OracleConfig
 from src.lp.lp import LPModule, LPConfig
 from src.perp.perp import PerpModule, PerpConfig
 from src.strategy.strategy import StrategyModule, StrategyConfig
-from src.portfolio.portfolio import PortfolioModule
+from src.portfolio.portfolio import PortfolioModule, TransactionType
 from src.engine.backtest_engine import BacktestEngine
 
-# --- Load Configuration ---
+# --- 1. Configuration Management ---
 def load_default_config():
-    try:
+    """โหลดค่าเริ่มต้นจากไฟล์ config.yaml ถ้ามี"""
+    if os.path.exists('config.yaml'):
         with open('config.yaml', 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
-    except Exception:
-        # Fallback หากไฟล์ config.yaml หายไป
-        return {}
+    return {}
 
 cfg = load_default_config()
 
-def get_cfg(section, key, fallback):
+def get_c(section, key, fallback):
+    """Helper สำหรับดึงค่า Config แบบมีค่า Fallback"""
     return cfg.get(section, {}).get(key, fallback)
 
-# --- Page Configuration ---
-st.set_page_config(page_title="Quant Lab v1.5.2", layout="wide", page_icon="🚀")
+# --- 2. UI Styling ---
+st.set_page_config(page_title="Quant Lab: LP & Smart Hedge", layout="wide", page_icon="🏎️")
 
 st.markdown("""
     <style>
     .main { background-color: #f8fafc; }
-    .stMetric { background-color: white; padding: 15px; border-radius: 15px; border: 1px solid #e2e8f0; }
-    [data-testid="stSidebar"] { background-color: #f1f5f9; }
+    .stMetric { background-color: white; padding: 20px; border-radius: 15px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); border: 1px solid #e2e8f0; }
+    .reportview-container .main { color: #1e293b; }
+    h1, h2, h3 { color: #1e293b; font-weight: 800; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- Sidebar Control Panel ---
+# --- 3. Sidebar: Command Center ---
 with st.sidebar:
-    st.title("⚙️ Strategy Control")
-    st.caption("v1.5.2 - Synced with config.yaml")
+    st.header("🎮 Dashboard Control")
+    st.caption("v1.5.6 Master | Engine v1.8.5")
     
-    with st.expander("📊 Market Simulator", expanded=True):
-        start_price = st.number_input("Start Price ($)", value=float(get_cfg('market', 'start_price', 2000.0)))
-        days = st.slider("Duration (Days)", 7, 360, int(get_cfg('market', 'days_to_run', 120)))
-        vol_def = float(get_cfg('market', 'annual_volatility', 0.5)) * 100
-        volatility = st.slider("Annual Volatility (%)", 10.0, 150.0, float(vol_def)) / 100
-        seed_def = get_cfg('market', 'seed', 42)
-        seed = st.number_input("Random Seed", value=int(seed_def) if seed_def else 42)
+    with st.expander("📈 Market Simulator", expanded=True):
+        start_price = st.number_input("ETH Start Price ($)", value=float(get_c('market', 'start_price', 2000.0)))
+        days = st.slider("Duration (Days)", 7, 365, int(get_c('market', 'days_to_run', 90)))
+        vol_def = float(get_c('market', 'annual_volatility', 0.8)) * 100
+        volatility = st.slider("Annual Volatility (%)", 10, 150, int(vol_def)) / 100
+        seed = st.number_input("Random Seed", value=int(get_c('market', 'seed', 42)))
 
-    with st.expander("🚜 LP Configuration", expanded=True):
-        lp_cap = st.number_input("LP Capital ($)", value=float(get_cfg('capital', 'lp_capital', 10000.0)))
-        base_apr_def = float(get_cfg('lp', 'base_apr', 0.05)) * 100
-        base_apr = st.slider("Base APR (%)", 1.0, 20.0, float(base_apr_def)) / 100
-        range_def = float(get_cfg('lp', 'range_width', 0.10)) * 100
-        range_width = st.slider("Range Width (±%)", 1.0, 50.0, float(range_def)) / 100
-        rebal_def = float(get_cfg('lp', 'rebalance_threshold', 0.20)) * 100
-        rebal_thresh = st.slider("Rebalance Threshold (%)", 5.0, 80.0, float(rebal_def)) / 100
+    with st.expander("🚜 LP Settings (Uniswap V3)", expanded=True):
+        lp_cap = st.number_input("LP Capital ($)", value=float(get_c('capital', 'lp_capital', 10000.0)))
+        base_apr = st.slider("Base Pool APR (%)", 1.0, 50.0, float(get_c('lp', 'base_apr', 0.05)*100)) / 100
+        range_w = st.slider("Range Width (±%)", 1.0, 50.0, float(get_c('lp', 'range_width', 0.10)*100)) / 100
+        rebal_t = st.slider("Rebalance Trigger (%)", 5, 50, int(get_c('lp', 'rebalance_threshold', 0.20)*100)) / 100
 
-    with st.expander("🛡️ Hedge & Capital Management", expanded=True):
-        perp_cap = st.number_input("CEX Capital ($)", value=float(get_cfg('capital', 'perp_capital', 3000.0)))
-        leverage = st.number_input("Leverage (x)", value=float(get_cfg('capital', 'leverage', 5.0)))
-        
-        hedge_mode_def = get_cfg('strategy', 'hedge_mode', 'smart')
-        h_index = 0 if hedge_mode_def == 'always' else 1
-        hedge_mode = st.selectbox("Hedge Mode", options=['always', 'smart'], index=h_index)
-        
-        hedge_thresh_def = float(get_cfg('strategy', 'hedge_threshold', 0.10)) * 100
-        hedge_thresh = st.slider("Hedge Threshold (%)", 1.0, 30.0, float(hedge_thresh_def)) / 100
-        
-        # [FIX] นำค่า Safety Net ออกมาให้ปรับได้
-        safe_net_def = float(get_cfg('strategy', 'safety_net_pct', 0.02)) * 100
-        safety_net_pct = st.slider("Safety Net Threshold (%)", 1.0, 15.0, float(safe_net_def)) / 100
-        
-        cross_rebal_freq = st.slider("Cross-Margin Freq (Days)", 1, 60, int(get_cfg('capital', 'rebalance_freq_days', 15)))
+    with st.expander("🛡️ Smart Hedge Guard", expanded=True):
+        perp_cap = st.number_input("CEX Margin ($)", value=float(get_c('capital', 'perp_capital', 5000.0)))
+        leverage = st.number_input("Leverage (x)", value=float(get_c('capital', 'leverage', 5.0)))
+        hedge_mode = st.selectbox("Hedge Mode", ['always', 'smart'], index=0 if get_c('strategy', 'hedge_mode', 'always')=='always' else 1)
+        hedge_t = st.slider("Hedge Adjustment Threshold (%)", 1, 30, int(get_c('strategy', 'hedge_threshold', 0.10)*100)) / 100
+        exec_lag = st.select_slider("Execution Lag (Min)", options=[1, 5, 15, 30, 60], value=int(get_c('execution', 'interval_minutes', 5)))
 
-    with st.expander("💸 Costs & Fees (Advanced)", expanded=False):
-        # [FIX] นำค่า Funding Rate ออกมาให้ปรับได้
-        fund_def = float(get_cfg('costs', 'funding_rate_8h', 0.0001)) * 100
-        funding_rate_8h = st.number_input("Funding Rate per 8H (%)", value=float(fund_def), format="%.4f") / 100
-        interval = st.select_slider("Execution Lag (Min)", options=[1, 5, 15, 30, 60], value=int(get_cfg('execution', 'interval_minutes', 5)))
-
-# --- Simulation Execution Logic ---
-def run_quant_sim():
-    oracle_cfg = OracleConfig(start_price=start_price, days=days, annual_volatility=volatility, seed=seed, timeframe='5m')
-    
+# --- 4. Simulation Logic Hook ---
+def run_simulation():
+    # Setup Config Objects
+    o_cfg = OracleConfig(start_price=start_price, days=days, annual_volatility=volatility, seed=seed)
     lp_cfg = LPConfig(
         initial_capital=lp_cap, 
-        range_width=range_width, 
-        rebalance_threshold=rebal_thresh, 
-        base_apr=base_apr, 
-        fee_mode='base_apr', 
-        gas_fee=float(get_cfg('costs', 'gas_fee_usd', 2.0)), 
-        slippage=float(get_cfg('costs', 'slippage', 0.001))
+        range_width=range_w, 
+        rebalance_threshold=rebal_t, 
+        base_apr=base_apr,
+        gas_fee=float(get_c('costs', 'gas_fee_usd', 2.0)),
+        slippage=float(get_c('costs', 'slippage', 0.001))
     )
-    
-    strat_cfg = StrategyConfig(
-        hedge_mode=hedge_mode, 
-        use_safety_net=True, 
-        safety_net_pct=safety_net_pct,  # [FIXED] ใช้ค่าจาก UI (ซึ่งดึงมาจาก YAML)
-        hedge_threshold=hedge_thresh, 
-        ema_period=int(get_cfg('strategy', 'ema_period', 200))
-    )
-    
-    perp_cfg = PerpConfig(
-        leverage=leverage, 
-        taker_fee=float(get_cfg('costs', 'perp_taker_fee', 0.0005))
-    )
-    
+    p_cfg = PerpConfig(leverage=leverage, taker_fee=float(get_c('costs', 'perp_taker_fee', 0.0005)))
+    s_cfg = StrategyConfig(hedge_mode=hedge_mode, hedge_threshold=hedge_t)
+
+    # Initialize Modules
     oracle = OracleModule()
     lp = LPModule(lp_cfg, start_price)
-    perp = PerpModule(perp_cfg)
+    perp = PerpModule(p_cfg)
     strategy = StrategyModule(lp, perp)
     portfolio = PortfolioModule(lp_cap + perp_cap)
     portfolio.allocate_to_lp(lp_cap)
     
+    # Engine Setup
     engine = BacktestEngine(oracle, lp, perp, strategy, portfolio)
-    data = oracle.generate_data(oracle_cfg)
+    data = oracle.generate_data(o_cfg)
+    funding_rate = float(get_c('costs', 'funding_rate_8h', 0.0001))
     
+    # Execute Run
     results = engine.run(
-        data, strat_cfg, 
-        funding_rate=funding_rate_8h, # [FIXED] ใช้ค่าจาก UI
-        cross_rebalance_config={'enabled': True, 'freq_days': cross_rebal_freq}, 
-        execution_interval_min=interval
+        data, s_cfg, 
+        funding_rate=funding_rate, 
+        execution_interval_min=exec_lag, 
+        record_all_ticks=True
     )
-    results['price'] = data['close'].values
-    
-    if 'lp_eth' in results.columns and 'perp_size' in results.columns:
-        results['residual_delta'] = results['lp_eth'] - results['perp_size']
-    else:
-        results['lp_eth'] = 0.0
-        results['perp_size'] = 0.0
-        results['residual_delta'] = 0.0
-        
-    if 'event' not in results.columns:
-        results['event'] = ""
-    
     return results, engine, lp
 
-# --- Main UI ---
-st.title("🚀 Quant Lab: Delta Hedge Dashboard")
-st.caption(f"Status: Synchronized (v1.5.2) | Config Loaded | Analysis: {datetime.now().strftime('%H:%M:%S')}")
+# --- 5. Main Dashboard View ---
+st.title("🚀 Quant Lab: LP & Smart Hedge Command Center")
+st.write(f"วิเคราะห์กลยุทธ์ Delta Neutral บน Uniswap V3 (Arbitrum) และ Binance Futures")
 
-if st.button("▶️ RUN BACKTEST SIMULATION", use_container_width=True):
-    with st.spinner("ประมวลผลกลยุทธ์และจำลองสถานการณ์ตลาด..."):
-        results, engine, lp_obj = run_quant_sim()
+if st.button("▶️ RUN MONTE CARLO SIMULATION", use_container_width=True):
+    with st.spinner("กำลังประมวลผลอัลกอริทึมและจำลองสภาวะตลาด..."):
+        res, engine, lp_final = run_simulation()
         
-        initial_cap = lp_cap + perp_cap
-        final_net_equity = results['net_equity'].iloc[-1]
-        total_withdrawn = results['total_withdrawn'].iloc[-1]
-        total_wealth = final_net_equity + total_withdrawn
+        # --- Metrics Calculation ---
+        init_total = lp_cap + perp_cap
+        final_equity = res['net_equity'].iloc[-1]
+        total_withdrawn = res['total_withdrawn'].iloc[-1]
+        total_wealth = final_equity + total_withdrawn
+        roi_pct = ((total_wealth / init_total) - 1) * 100
+        cagr = (pow(1 + (roi_pct/100), 365/days) - 1) * 100 if roi_pct > -100 else -100
         
-        roi_pct = ((total_wealth / initial_cap) - 1) * 100
-        cagr = (pow(1 + (roi_pct/100), 365/days) - 1) * 100
+        wealth_series = res['net_equity'] + res['total_withdrawn']
+        mdd = ((wealth_series - wealth_series.cummax()) / wealth_series.cummax()).min() * 100
+
+        # --- Metric Cards Row ---
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total Wealth Created", f"${total_wealth:,.2f}", f"{roi_pct:+.2f}% ROI")
+        c2.metric("Annualized CAGR", f"{cagr:.2f}%")
+        c3.metric("Max Drawdown", f"{mdd:.2f}%", delta_color="inverse")
+        c4.metric("Effective LP APR", f"{lp_final.config.base_apr * lp_final.multiplier * 100:.1f}%")
+
+        # --- Chart 1: Equity Curve ---
+        st.subheader("📈 Portfolio Performance Analysis")
+        fig_equity = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_equity.add_trace(go.Scatter(x=res.index, y=res['net_equity'], name="Net Equity (Live)", line=dict(color='#6366f1', width=3)), secondary_y=False)
+        fig_equity.add_trace(go.Scatter(x=res.index, y=wealth_series, name="Total Wealth (Inc. Fees)", line=dict(color='#10b981', width=2, dash='dot')), secondary_y=False)
+        fig_equity.add_trace(go.Scatter(x=res.index, y=res['price'], name="ETH Price", line=dict(color='#94a3b8', width=1), opacity=0.3), secondary_y=True)
+        fig_equity.update_layout(height=450, hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        st.plotly_chart(fig_equity, use_container_width=True)
+
+        # --- Chart 2 & 3: Hedge Dynamics ---
+        st.subheader("🛡️ Hedge Dynamics & Residual Risk")
+        col_chart, col_stats = st.columns([2, 1])
         
-        wealth_series = results['net_equity'] + results['total_withdrawn']
-        roll_max = wealth_series.cummax()
-        dd = (wealth_series - roll_max) / roll_max
-        max_dd = dd.min() * 100
+        with col_chart:
+            # Mirroring Effect (LP vs Perp)
+            fig_hedge = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_hedge.add_trace(go.Scatter(x=res.index, y=res['lp_value'], name="LP Value (Long)", line=dict(color='#10b981', width=2)), secondary_y=False)
+            perp_eq = res['cex_wallet_balance'] + res['perp_pnl']
+            fig_hedge.add_trace(go.Scatter(x=res.index, y=perp_eq, name="Perp Margin (Short)", line=dict(color='#3b82f6', width=2)), secondary_y=False)
+            fig_hedge.update_layout(height=350, title="Mirroring Effect: On-chain vs CEX")
+            st.plotly_chart(fig_hedge, use_container_width=True)
+            
+            # Residual Delta (Fixed Plotly Area)
+            fig_delta = go.Figure()
+            fig_delta.add_trace(go.Scatter(
+                x=res.index, y=res['residual_delta'], 
+                name="Residual Delta (ETH Gap)", 
+                fill='tozeroy', mode='lines', 
+                line=dict(color='#f43f5e')
+            ))
+            fig_delta.update_layout(height=200, title="Residual Risk (Delta Gap)", yaxis_title="ETH Amount")
+            st.plotly_chart(fig_delta, use_container_width=True)
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Wealth Created", f"${total_wealth:,.2f}", f"{roi_pct:+.2f}% ROI")
-        m2.metric("Annualized CAGR", f"{cagr:.2f}%")
-        m3.metric("Max Drawdown", f"{max_dd:.2f}%", delta_color="inverse")
-        m4.metric("Effective APR", f"{lp_obj.config.base_apr * lp_obj.multiplier * 100:.1f}%")
+        with col_stats:
+            st.markdown("### 📋 Activity Audit")
+            st.write(f"- **LP Rebalances:** {engine.lp.rebalance_count} ครั้ง")
+            st.write(f"- **Hedge Trades:** {engine.hedge_count} ครั้ง")
+            st.info(f"**Max Residual Delta:** {res['residual_delta'].abs().max():.4f} ETH")
+            
+            st.markdown("### 💰 PnL Decomposition")
+            # ดึงข้อมูลจาก Ledger ของ Portfolio
+            ledger = engine.portfolio.ledgers
+            total_fee = ledger[TransactionType.REVENUE_LP_FEE]
+            total_funding = ledger[TransactionType.REVENUE_FUNDING] + ledger[TransactionType.EXPENSE_FUNDING]
+            total_cost = abs(ledger[TransactionType.EXPENSE_GAS]) + \
+                         abs(ledger[TransactionType.EXPENSE_PERP_FEE]) + \
+                         abs(ledger[TransactionType.EXPENSE_SLIPPAGE])
+            
+            st.write(f"➕ Gross LP Fees: `${total_fee:,.2f}`")
+            st.write(f"➕ Net Funding: `${total_funding:,.2f}`")
+            st.write(f"➖ Operational Costs: `$-{total_cost:,.2f}`")
+            
+            # คำนวณ IL และ Residual Impact (ผลต่างที่เหลือจากกำไรจริง)
+            net_profit = total_wealth - init_total
+            il_residual_impact = net_profit - (total_fee + total_funding - total_cost)
+            
+            st.write(f"📉 IL & Residual Impact: `${il_residual_impact:,.2f}`")
+            st.divider()
+            st.success(f"**Final Net Profit:** `${net_profit:,.2f}`")
 
-        # --- Charts Section ---
-        st.subheader("📈 Portfolio Analysis")
-        
-        fig1 = make_subplots(specs=[[{"secondary_y": True}]])
-        fig1.add_trace(go.Scatter(x=results.index, y=results['net_equity'], name="Live Equity", line=dict(color='#6366f1', width=2)), secondary_y=False)
-        fig1.add_trace(go.Scatter(x=results.index, y=wealth_series, name="Total Wealth", line=dict(color='#10b981', width=2, dash='dash')), secondary_y=False)
-        fig1.add_trace(go.Scatter(x=results.index, y=results['price'], name="ETH Price", line=dict(color='#94a3b8', width=1), opacity=0.4), secondary_y=True)
-        fig1.update_layout(title="Portfolio Equity Progression", hovermode="x unified", height=450)
-        st.plotly_chart(fig1, use_container_width=True)
-
-        st.subheader("🛡️ Hedge Engine Dynamics (LP vs CEX)")
-        perp_equity_series = results['cex_wallet_balance'] + results['perp_pnl']
-        
-        fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-        fig2.add_trace(go.Scatter(x=results.index, y=results['lp_value'], name="LP Value (On-chain)", line=dict(color='#10b981', width=2)), secondary_y=False)
-        fig2.add_trace(go.Scatter(x=results.index, y=perp_equity_series, name="Perp Margin (CEX)", line=dict(color='#3b82f6', width=2)), secondary_y=False)
-        fig2.add_trace(go.Scatter(x=results.index, y=results['price'], name="ETH Price", line=dict(color='#94a3b8', width=1), opacity=0.25), secondary_y=True)
-        fig2.update_layout(title="Component Equity Analysis (Mirroring)", hovermode="x unified", height=450)
-        st.plotly_chart(fig2, use_container_width=True)
-
-        # --- Stats Breakdown ---
-        c_a, c_b = st.columns(2)
-        with c_a:
-            st.markdown("### 📊 Activity Stats")
-            st.write(f"- LP Rebalances: {engine.lp.rebalance_count} times")
-            st.write(f"- Hedge Trades: {engine.hedge_count} times")
-            st.write(f"- Cross-Margin Sweeps: {engine.cross_rebalance_count} times")
-            st.write(f"- Margin Call Rejects: `{len(engine.margin_call_events)}` 🚨")
-        with c_b:
-            st.markdown("### 💰 PnL Breakdown")
-            st.write(f"- Gross LP Fees: `${engine.lp.accumulated_fees:,.2f}`")
-            st.write(f"- Net Funding Rate: `${engine.perp.total_funding_pnl:,.2f}`")
-            st.write(f"- Min Margin Buffer: `${results['cex_available_margin'].min():,.2f}`")
-
-        # --- Download Button ---
-        csv = results.to_csv(index=False).encode('utf-8')
+        # --- Data Export ---
+        st.divider()
+        csv = res.to_csv(index=False).encode('utf-8')
         st.download_button(
-            label="📥 Download Full CSV",
+            label="📥 Download Tick-by-Tick Audit CSV",
             data=csv,
-            file_name=f"quant_full_result_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
+            file_name=f"quant_lab_audit_{seed}_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime='text/csv',
             use_container_width=True
         )
 else:
-    st.info("👈 ตัวแปรที่ซ่อนอยู่ถูกลิงก์กับ config.yaml แล้ว กดปุ่ม RUN เพื่อเริ่มการจำลองผลได้เลยครับ")
+    # Landing Info
+    st.info("💡 ปรับพารามิเตอร์ที่ Sidebar แล้วกดปุ่มด้านบนเพื่อเริ่มการ Backtest ครับ")
+    st.image("https://img.freepik.com/free-vector/data-inform-chart-graphics-business-statistics-concept_53876-119102.jpg", 
+             use_column_width=True, caption="Simulation Baseline v1.5.6 Master")

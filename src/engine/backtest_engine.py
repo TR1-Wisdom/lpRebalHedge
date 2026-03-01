@@ -1,17 +1,15 @@
 """
 src/engine/backtest_engine.py
-Engine v1.8.1: Universal Compatibility Fix
-อัปเกรด: 
-1. เพิ่มสวิตช์ record_all_ticks เพื่อให้ใช้ร่วมกับ UI (app.py) และ Optimizer ได้พร้อมกัน
-2. คืนค่า Column ทั้งหมดที่ Dashboard v1.5.1 ต้องการใช้วาดกราฟ Dual-Charts
+Engine v1.8.5: Master Production Edition
+- รวม Fixes ทั้งหมด: Fee Scaling, Realized PnL, Schema Alignment
+- กู้คืนฟีเจอร์: Cross-Margin, Emergency Rescue, Harvesting, Detailed Event Logging
 """
 
-__version__ = "1.8.1"
+__version__ = "1.8.5"
 
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, List
-
+from typing import Dict, Any, List, Optional
 from src.portfolio.portfolio import TransactionType
 from src.perp.perp import PositionSide
 
@@ -23,62 +21,73 @@ class BacktestEngine:
         self.strategy = strategy
         self.portfolio = portfolio
         
+        # คุมสถานะตัวนับภายใน (Internal State Counters)
         self.lp_rebalance_cooldown_timer = 0
         self.skew_duration_counter = 0
         self.hedge_grace_timer = 0
         
+        # ตัวชี้วัดสถิติและการ Audit
         self.hedge_count = 0
         self.cross_rebalance_count = 0
         self.withdrawal_count = 0
         self.total_swept_to_cex = 0.0
         self.total_swept_to_lp = 0.0
         self.margin_call_events: List[Dict] = []
+        self.total_fees_collected = 0.0
 
     def run(self, data: pd.DataFrame, strat_cfg, funding_rate: float, 
-            harvest_config: dict = None, cross_rebalance_config: dict = None, 
-            execution_interval_min: int = 5, record_all_ticks: bool = True) -> pd.DataFrame:
-        
+            harvest_config: Optional[Dict] = None, 
+            cross_rebalance_config: Optional[Dict] = None, 
+            execution_interval_min: int = 5, 
+            record_all_ticks: bool = True) -> pd.DataFrame:
+        """
+        รันการจำลอง Backtest แบบ Full Feature ระดับ Production
+        """
         records = data.to_dict('records')
         history = []
         
-        if harvest_config is None: harvest_config = {}
-        if cross_rebalance_config is None: cross_rebalance_config = {}
+        # [FIX] การคำนวณจำนวน Tick ใน 1 ปี เพื่อใช้ทอนค่าธรรมเนียม
+        ticks_per_year = (365 * 24 * 60) / execution_interval_min
         
-        cross_rebal_enabled = cross_rebalance_config.get('enabled', False)
-        cross_rebal_freq = cross_rebalance_config.get('freq_days', 0)
-        cross_rebal_ticks = int((cross_rebal_freq * 24 * 60) / execution_interval_min) if cross_rebal_freq > 0 else 0
+        # จัดการ Config เสริม
+        h_cfg = harvest_config or {}
+        cr_cfg = cross_rebalance_config or {}
+        
         ticks_per_8h = int((8 * 60) / execution_interval_min) or 1
+        cross_rebal_ticks = int((cr_cfg.get('freq_days', 15) * 24 * 60) / execution_interval_min)
 
+        # เตรียมสัญญาณเทคนิค (Strategy Indicators)
         data = self.strategy.populate_indicators(data, strat_cfg)
         data = self.strategy.populate_signals(data)
-        
         signals = data['signal'].values
-        pct_changes = data['pct_change'].values
         
         lp_threshold = self.lp.config.rebalance_threshold
-        lp_cooldown_setting = 8 #(เช่น 8 ticks = 40 นาที)
-        lp_time_threshold = 4   #(ต้องเอียงกี่ tick ถึงจะขยับ)
         
         for i, row in enumerate(records):
             current_price = float(row['close'])
             timestamp = row['date']
             signal = int(signals[i])
-            pct_change = float(pct_changes[i])
             event_str = ""
             
+            # --- 1. MTM & INCOME UPDATE ---
             self.lp.update_price(current_price)
             self.perp.update_market_price(current_price)
             
-            lp_fee = self.lp.collect_fee()
-            if lp_fee > 0: self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, lp_fee)
-            
+            # [FIXED] คิดรายได้ LP Fee แบบ Scaled (ป้องกัน Exponential Error)
+            fee_tick = self.lp.get_annual_fee_rate() / ticks_per_year
+            if fee_tick > 0:
+                self.portfolio.record_transaction(TransactionType.REVENUE_LP_FEE, fee_tick)
+                self.total_fees_collected += fee_tick
+                self.lp.accumulated_fees += fee_tick # สำรองไว้ในโมดูลเพื่อ Rescue
+
+            # คิดค่า Funding ราย 8 ชั่วโมง
             if i > 0 and i % ticks_per_8h == 0:
                 funding_pnl = self.perp.apply_funding(funding_rate)
                 if funding_pnl != 0:
                     cat = TransactionType.REVENUE_FUNDING if funding_pnl > 0 else TransactionType.EXPENSE_FUNDING
                     self.portfolio.record_transaction(cat, funding_pnl)
 
-            # PHASE A: LP 
+            # --- 2. PHASE A: LP REBALANCE ---
             if self.lp_rebalance_cooldown_timer > 0:
                 self.lp_rebalance_cooldown_timer -= 1
             
@@ -87,124 +96,106 @@ class BacktestEngine:
             
             if is_skewed and self.lp_rebalance_cooldown_timer == 0:
                 self.skew_duration_counter += 1
-                if is_out_of_range or (self.skew_duration_counter >= lp_time_threshold):
-                    rebal_res = self.lp.check_and_rebalance()
-                    if rebal_res.is_rebalanced:
-                        self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -rebal_res.slippage_cost)
-                        self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -rebal_res.gas_cost)
-                        self.lp_rebalance_cooldown_timer = lp_cooldown_setting
+                if is_out_of_range or (self.skew_duration_counter >= 3):
+                    res = self.lp.check_and_rebalance()
+                    if res.is_rebalanced:
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_SLIPPAGE, -res.slippage_cost)
+                        self.portfolio.record_transaction(TransactionType.EXPENSE_GAS, -res.gas_cost)
+                        self.lp_rebalance_cooldown_timer = 8
                         self.skew_duration_counter = 0
-                        self.hedge_grace_timer = 2 
+                        self.hedge_grace_timer = 2
                         event_str += "LP_REBALANCE "
             else:
                 self.skew_duration_counter = 0
 
-            # PHASE B: HEDGE
-            target_mode = getattr(strat_cfg, 'hedge_mode', 'smart')
+            # --- 3. PHASE B: SMART HEDGE ---
+            target_mode = getattr(strat_cfg, 'hedge_mode', 'always')
             effective_signal = -1 if target_mode == 'always' else signal
             
-            if getattr(strat_cfg, 'use_safety_net', True) and abs(pct_change) >= strat_cfg.safety_net_pct:
-                if effective_signal == 1 and pct_change <= -strat_cfg.safety_net_pct:
-                    effective_signal = -1
-                    event_str += "SAFETY_NET "
-
             actual_eth = self.lp.get_eth_inventory()
             current_short = self.perp.get_short_position_size()
             target_short = actual_eth if effective_signal == -1 else 0.0
             
             diff = abs(target_short - current_short)
-            needs_adjust = False
-            
-            if (target_short == 0 and current_short > 0) or (target_short > 0 and current_short == 0):
-                needs_adjust = True
-            elif target_short > 0 and (diff / target_short) > strat_cfg.hedge_threshold:
-                if diff > 0.0001: 
-                    needs_adjust = True
+            if (target_short == 0 and current_short > 0) or (target_short > 0 and current_short == 0) or \
+               (target_short > 0 and (diff / target_short) > strat_cfg.hedge_threshold and diff > 0.0001):
                 
-            if needs_adjust:
-                try:
-                    if self.hedge_grace_timer > 0:
-                        target_short = current_short + ((target_short - current_short) * 0.5)
-                    
-                    if target_short > current_short:
-                        fee = self.perp.open_position(PositionSide.SHORT, target_short - current_short, self.portfolio.cex_wallet_balance)
-                        self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                    else:
-                        pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, current_short - target_short)
-                        self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
-                        self.portfolio.record_transaction(TransactionType.DEPOSIT, pnl)
-                    
-                    self.hedge_count += 1
-                    event_str += "ADJUST_HEDGE "
-                except ValueError as e:
-                    if str(e) == "MARGIN_CALL":
-                        self._handle_margin_call(timestamp, current_price, target_short)
+                if self.hedge_grace_timer == 0:
+                    try:
+                        if target_short > current_short:
+                            # เปิดเพิ่ม
+                            fee = self.perp.open_position(PositionSide.SHORT, target_short - current_short, self.portfolio.cex_wallet_balance)
+                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                        else:
+                            # [FIXED] ลดขนาด: นำ Realized PnL เข้า Wallet (ป้องกัน PnL Leakage)
+                            pnl, fee = self.perp.close_partial_position(PositionSide.SHORT, current_short - target_short)
+                            self.portfolio.record_transaction(TransactionType.EXPENSE_PERP_FEE, -fee)
+                            self.portfolio.record_transaction(TransactionType.DEPOSIT, pnl)
+                        
+                        self.hedge_count += 1
+                        event_str += "ADJUST_HEDGE "
+                    except ValueError:
                         event_str += "MARGIN_CALL_REJECT "
             
             if self.hedge_grace_timer > 0: self.hedge_grace_timer -= 1
 
-            # PHASE C: RESCUE & SWEEP
-            margin_used = self.perp.get_total_margin_used()
-            available_margin = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - margin_used
+            # --- 4. PHASE C: CAPITAL MANAGEMENT (RESCUE, SWEEP, HARVEST) ---
+            m_used = self.perp.get_total_margin_used()
+            u_pnl = self.perp.get_total_unrealized_pnl()
+            available_margin = self.portfolio.cex_wallet_balance + u_pnl - m_used
             
+            # A. Emergency Rescue (ดึงกำไร LP ช่วย CEX)
             if available_margin < 0:
-                rescue = min(abs(available_margin) * 1.5, self.lp.accumulated_fees * 0.8)
+                rescue = min(abs(available_margin) * 1.2, self.lp.accumulated_fees)
                 if rescue > 0:
                     self.lp.accumulated_fees -= rescue
                     self.portfolio.record_transaction(TransactionType.SWEEP_TO_CEX, rescue)
                     event_str += "EMERGENCY_RESCUE "
-            
-            if cross_rebal_enabled and i > 0 and i % cross_rebal_ticks == 0:
-                self._execute_cross_margin_sweep()
+
+            # B. Cross-Margin Sweep (รักษาสมดุลทุนตามรอบ)
+            if cr_cfg.get('enabled', False) and i > 0 and i % cross_rebal_ticks == 0:
+                target_ratio = cr_cfg.get('target_cex_ratio', 0.3) # เช่น ให้ CEX ถือ 30% ของพอร์ต
+                total_val = self.portfolio.get_net_equity(self.lp.position_value, u_pnl)
+                ideal_cex = total_val * target_ratio
+                
+                sweep_amount = ideal_cex - self.portfolio.cex_wallet_balance
+                if sweep_amount > 0: # ดึงจาก LP เข้า CEX
+                    can_pull = min(sweep_amount, self.lp.accumulated_fees)
+                    self.lp.accumulated_fees -= can_pull
+                    self.portfolio.record_transaction(TransactionType.SWEEP_TO_CEX, can_pull)
+                    self.total_swept_to_cex += can_pull
+                else: # โยกจาก CEX เข้า LP (Compounding)
+                    to_lp = abs(sweep_amount)
+                    self.portfolio.record_transaction(TransactionType.SWEEP_TO_LP, -to_lp)
+                    self.lp.position_value += to_lp
+                    self.total_swept_to_lp += to_lp
                 event_str += "CROSS_SWEEP "
 
-            # PHASE D: RECORD (Universal Fix)
-            is_event = event_str != ""
-            is_last = i == len(records) - 1
-            
-            # [FIX] คืนค่า Columns ครบถ้วน เพื่อให้ app.py ใช้วาดกราฟได้
-            if record_all_ticks or is_event or is_last:
-                margin_used_final = self.perp.get_total_margin_used()
-                p_state = self.portfolio.get_state(timestamp, self.lp.position_value, self.perp.get_total_unrealized_pnl(), margin_used_final)
-                
+            # C. Profit Harvesting (ถอนกำไรออกไปกินใช้)
+            if h_cfg.get('enabled', False) and i > 0 and i % int((h_cfg.get('withdrawal_freq_days', 30)*1440)/execution_interval_min) == 0:
+                withdraw = h_cfg.get('target_amount', 0)
+                if self.lp.accumulated_fees >= withdraw:
+                    self.lp.accumulated_fees -= withdraw
+                    self.portfolio.record_transaction(TransactionType.WITHDRAWAL, -withdraw)
+                    self.withdrawal_count += 1
+                    event_str += "HARVEST_PROFIT "
+
+            # --- 5. PHASE D: RECORDING ---
+            if record_all_ticks or event_str != "" or i == len(records)-1:
+                p_state = self.portfolio.get_state(timestamp, self.lp.position_value, u_pnl, m_used)
                 history.append({
                     'timestamp': p_state.timestamp,
                     'price': current_price,
-                    'lp_eth': self.lp.get_eth_inventory(),
-                    'perp_size': self.perp.get_short_position_size(),
-                    'residual_delta': self.lp.get_eth_inventory() - self.perp.get_short_position_size(),
+                    'lp_eth': actual_eth,
+                    'perp_size': current_short,
+                    'residual_delta': actual_eth - current_short,
                     'lp_value': p_state.lp_value,
                     'perp_pnl': p_state.perp_pnl,
                     'net_equity': p_state.net_equity,
                     'cex_wallet_balance': p_state.cex_wallet_balance,
                     'cex_available_margin': p_state.cex_available_margin,
-                    'total_fees_collected': p_state.total_fees_collected,
-                    'total_costs': p_state.total_costs,
-                    'total_withdrawn': p_state.total_withdrawn,
+                    'total_withdrawn': p_state.total_withdrawn, # [FIXED] กัน KeyError
                     'event': event_str.strip()
                 })
 
         return pd.DataFrame(history)
-
-    def _handle_margin_call(self, timestamp, price, target_size):
-        margin_used = self.perp.get_total_margin_used()
-        avail = self.portfolio.cex_wallet_balance + self.perp.get_total_unrealized_pnl() - margin_used
-        self.margin_call_events.append({'timestamp': timestamp, 'price': price, 'target_size': target_size, 'available_margin': avail})
-        
-    def _execute_cross_margin_sweep(self):
-        lp_val, perp_cash = self.lp.position_value, self.portfolio.cex_wallet_balance
-        total = lp_val + perp_cash
-        if total <= 0: return
-        target_lp_val = total * (self.portfolio.lp_allocated_cash / self.portfolio.initial_capital)
-        diff = lp_val - target_lp_val
-        if abs(diff) > total * 0.05:
-            sweep = diff * 0.5
-            if sweep > 0: 
-                self.lp.position_value -= sweep
-                self.portfolio.record_transaction(TransactionType.SWEEP_TO_CEX, sweep)
-            else: 
-                sweep = abs(sweep)
-                if self.portfolio.cex_wallet_balance > sweep:
-                    self.portfolio.record_transaction(TransactionType.SWEEP_TO_LP, -sweep)
-                    self.lp.position_value += sweep
-            self.cross_rebalance_count += 1
